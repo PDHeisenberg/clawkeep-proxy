@@ -39,6 +39,9 @@ PROVIDER_URLS = {
     "gemini":    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
 }
 
+# OpenAI Responses API — used for web_search_preview tool (deep research with web grounding)
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("clawproxy")
 
@@ -71,6 +74,40 @@ async def chat_completions(request: Request):
         return await _forward_anthropic(body, model, stream)
     else:
         return await _forward_openai_compat(body, model, stream)
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    """
+    Passthrough for OpenAI Responses API (required for web_search_preview tool).
+    Only works with AI_PROVIDER=openai. Supports deep research with live web grounding.
+    """
+    check_auth(request)
+
+    if AI_PROVIDER != "openai":
+        raise HTTPException(
+            status_code=400,
+            detail=f"/v1/responses requires AI_PROVIDER=openai (current: {AI_PROVIDER})"
+        )
+
+    body = await request.json()
+    stream = body.get("stream", False)
+
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    if stream:
+        return await _stream_response(OPENAI_RESPONSES_URL, headers, body, "openai")
+
+    # Responses API calls can be long (web searches take time)
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.post(OPENAI_RESPONSES_URL, headers=headers, json=body)
+        if r.status_code != 200:
+            log.error("Responses API error %s: %s", r.status_code, r.text[:300])
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return JSONResponse(r.json())
 
 
 # ─── Anthropic forwarding ─────────────────────────────────────────────────────
