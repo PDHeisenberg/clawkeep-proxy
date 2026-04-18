@@ -8,11 +8,14 @@ Config via environment variables (Railway injects these) or local config.env
 """
 
 import os
+import time
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
+import jwt
 import uvicorn
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -32,6 +35,21 @@ AI_API_KEY     = os.environ.get("AI_API_KEY", "")
 DEFAULT_MODEL  = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
 PORT           = int(os.environ.get("PORT", "8080"))
 
+# ── Pro subscription auth (receipt → JWT) ────────────────────────────────────
+APPLE_SHARED_SECRET = os.environ.get("APPLE_SHARED_SECRET", "")
+JWT_SECRET          = os.environ.get("JWT_SECRET", "")
+JWT_ALGORITHM       = "HS256"
+JWT_EXPIRY_DAYS     = 30
+
+APPLE_PROD_URL    = "https://buy.itunes.apple.com/verifyReceipt"
+APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
+
+VALID_PRODUCT_IDS = {
+    "com.clawkeep.pro.monthly",
+    "com.clawkeep.pro.yearly",
+}
+EXPECTED_BUNDLE_ID = "Personal.ClawKeep"
+
 # Provider upstream URLs
 PROVIDER_URLS = {
     "anthropic": "https://api.anthropic.com/v1/messages",
@@ -50,10 +68,127 @@ app = FastAPI(title="ClawKeep Pro Proxy", version="1.0.0")
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def check_auth(request: Request):
+    """Accept either a valid per-user JWT or the legacy shared token.
+
+    Dual-auth exists during the transition from the shared beta token to
+    per-user JWTs. Once all shipped app builds are minting JWTs from
+    /validate-receipt, the shared token branch can be removed.
+    """
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
-    if token != BEARER_TOKEN:
+    if not token:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if token == BEARER_TOKEN:
+        return
+
+    if JWT_SECRET:
+        try:
+            jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            return
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Unauthorized: token expired")
+        except jwt.InvalidTokenError:
+            pass
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ─── Apple receipt verification + JWT minting ────────────────────────────────
+
+async def _verify_apple_receipt(receipt_b64: str) -> dict:
+    if not APPLE_SHARED_SECRET:
+        raise HTTPException(status_code=500, detail="APPLE_SHARED_SECRET not configured")
+
+    payload = {
+        "receipt-data": receipt_b64,
+        "password": APPLE_SHARED_SECRET,
+        "exclude-old-transactions": True,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(APPLE_PROD_URL, json=payload)
+        data = r.json()
+        # 21007 → this is a sandbox receipt, retry against sandbox URL
+        if data.get("status") == 21007:
+            r = await client.post(APPLE_SANDBOX_URL, json=payload)
+            data = r.json()
+
+    status = data.get("status")
+    if status != 0:
+        raise HTTPException(status_code=400, detail=f"Apple receipt status {status}")
+
+    bundle_id = data.get("receipt", {}).get("bundle_id", "")
+    if bundle_id != EXPECTED_BUNDLE_ID:
+        raise HTTPException(status_code=400, detail="Bundle ID mismatch")
+
+    return data
+
+
+def _latest_active_subscription(receipt_data: dict) -> dict:
+    entries = receipt_data.get("latest_receipt_info") or []
+    if not entries:
+        entries = receipt_data.get("receipt", {}).get("in_app", [])
+
+    subs = [e for e in entries if e.get("product_id") in VALID_PRODUCT_IDS]
+    if not subs:
+        raise HTTPException(status_code=402, detail="No ClawKeep Pro subscription found")
+
+    subs.sort(key=lambda e: int(e.get("expires_date_ms", 0)), reverse=True)
+    latest = subs[0]
+
+    expires_ms = int(latest.get("expires_date_ms", 0))
+    now_ms = int(time.time() * 1000)
+    grace_ms = 7 * 24 * 60 * 60 * 1000
+    if expires_ms + grace_ms < now_ms:
+        raise HTTPException(status_code=402, detail="Subscription expired")
+
+    return latest
+
+
+def _mint_jwt(transaction_id: str, product_id: str, sub_expires_ms: int) -> tuple[str, int]:
+    now = int(time.time())
+    sub_expires_sec = int(sub_expires_ms / 1000)
+    default_exp = now + JWT_EXPIRY_DAYS * 24 * 60 * 60
+    exp = min(sub_expires_sec, default_exp) if sub_expires_sec > now else default_exp
+
+    tier = "yearly" if "yearly" in product_id else "monthly"
+    payload = {
+        "sub": transaction_id,
+        "tier": tier,
+        "exp": exp,
+        "iat": now,
+    }
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET not configured")
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return token, exp
+
+
+@app.post("/validate-receipt")
+async def validate_receipt(request: Request):
+    """iOS POSTs App Store receipt, gets a per-user JWT in return."""
+    body = await request.json()
+    receipt_b64 = body.get("receipt_data")
+    if not receipt_b64:
+        raise HTTPException(status_code=400, detail="Missing receipt_data")
+
+    apple_data = await _verify_apple_receipt(receipt_b64)
+    sub = _latest_active_subscription(apple_data)
+
+    transaction_id = sub.get("original_transaction_id", "")
+    product_id = sub.get("product_id", "")
+    expires_ms = int(sub.get("expires_date_ms", 0))
+
+    token, exp = _mint_jwt(transaction_id, product_id, expires_ms)
+    tier = "yearly" if "yearly" in product_id else "monthly"
+    expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    return JSONResponse({
+        "token": token,
+        "expires_at": expires_at,
+        "tier": tier,
+    })
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
