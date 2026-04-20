@@ -22,6 +22,8 @@ import uvicorn
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from appstoreserverlibrary.signed_data_verifier import SignedDataVerifier, VerificationException
+from appstoreserverlibrary.models.Environment import Environment
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -39,8 +41,10 @@ AI_API_KEY     = os.environ.get("AI_API_KEY", "")
 DEFAULT_MODEL  = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
 PORT           = int(os.environ.get("PORT", "8080"))
 
-# ── Pro subscription auth (receipt → JWT) ────────────────────────────────────
-APPLE_SHARED_SECRET = os.environ.get("APPLE_SHARED_SECRET", "")
+# ── Pro subscription auth (StoreKit 2 JWS → JWT) ─────────────────────────────
+# APPLE_SHARED_SECRET is retained for legacy reference only — the current
+# validation path uses StoreKit 2 JWS + offline signature verification and no
+# longer talks to Apple's deprecated verifyReceipt endpoint.
 JWT_SECRET          = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM       = "HS256"
 JWT_EXPIRY_DAYS     = 30
@@ -51,14 +55,59 @@ if not JWT_SECRET:
         "Generate one with: openssl rand -hex 32"
     )
 
-APPLE_PROD_URL    = "https://buy.itunes.apple.com/verifyReceipt"
-APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
-
 VALID_PRODUCT_IDS = {
     "com.clawkeep.pro.monthly",
     "com.clawkeep.pro.yearly",
 }
 EXPECTED_BUNDLE_ID = "Personal.ClawKeep"
+
+# App Apple ID: numeric ID assigned in App Store Connect once the app is listed.
+# Required by Apple's library when verifying Production JWS. Leave unset for
+# TestFlight-only pre-launch testing; the Sandbox verifier doesn't need it.
+APP_APPLE_ID = os.environ.get("APP_APPLE_ID", "")
+APP_APPLE_ID_INT = int(APP_APPLE_ID) if APP_APPLE_ID.isdigit() else None
+
+# Apple's Root CA certificate (G3). Shipped in the repo so verification is
+# fully offline — no dependency on Apple's verifyReceipt endpoint, which
+# deprecated our previous flow and returned 21002 for modern StoreKit 2
+# receipts. Cert fetched from https://www.apple.com/certificateauthority/
+_APPLE_ROOT_CERT_PATH = Path(__file__).parent / "AppleRootCA-G3.cer"
+try:
+    _APPLE_ROOT_CERTS = [_APPLE_ROOT_CERT_PATH.read_bytes()]
+except FileNotFoundError:
+    raise RuntimeError(
+        f"Missing Apple root certificate at {_APPLE_ROOT_CERT_PATH}. "
+        "Run: curl -sSLo AppleRootCA-G3.cer https://www.apple.com/certificateauthority/AppleRootCA-G3.cer"
+    )
+
+# One verifier per environment. Each attempt is tried in order until one
+# accepts the JWS, so a single endpoint works for TestFlight (Sandbox) and
+# App Store (Production) without the caller having to know which it is.
+# The Production verifier requires the numeric App Apple ID (assigned by
+# App Store Connect once the app is listed). Until that ID is configured,
+# only Sandbox is wired up — which covers TestFlight + sandbox purchases.
+_VERIFIERS: list[tuple[Environment, SignedDataVerifier]] = []
+if APP_APPLE_ID_INT is not None:
+    _VERIFIERS.append((
+        Environment.PRODUCTION,
+        SignedDataVerifier(
+            root_certificates=_APPLE_ROOT_CERTS,
+            enable_online_checks=False,
+            environment=Environment.PRODUCTION,
+            bundle_id=EXPECTED_BUNDLE_ID,
+            app_apple_id=APP_APPLE_ID_INT,
+        ),
+    ))
+_VERIFIERS.append((
+    Environment.SANDBOX,
+    SignedDataVerifier(
+        root_certificates=_APPLE_ROOT_CERTS,
+        enable_online_checks=False,
+        environment=Environment.SANDBOX,
+        bundle_id=EXPECTED_BUNDLE_ID,
+        app_apple_id=None,
+    ),
+))
 
 # Provider upstream URLs
 PROVIDER_URLS = {
@@ -130,68 +179,52 @@ def check_auth(request: Request):
     request.state.sub = payload.get("sub", "-")
 
 
-# ─── Apple receipt verification + JWT minting ────────────────────────────────
+# ─── Apple StoreKit 2 JWS verification + JWT minting ─────────────────────────
 
-async def _verify_apple_receipt(receipt_b64: str) -> dict:
-    if not APPLE_SHARED_SECRET:
-        raise HTTPException(status_code=500, detail="APPLE_SHARED_SECRET not configured")
+def _verify_transaction_jws(jws: str):
+    """Verify a StoreKit 2 signed transaction JWS and return the decoded payload.
 
-    payload = {
-        "receipt-data": receipt_b64,
-        "password": APPLE_SHARED_SECRET,
-        "exclude-old-transactions": True,
-    }
+    Tries every configured verifier (Production first if available, then
+    Sandbox). iOS hands us the JWS straight from
+    `Transaction.currentEntitlements` — Apple signs it with a cert chain
+    rooted at AppleRootCA-G3, which the verifier validates offline.
+    """
+    last_error: VerificationException | None = None
+    for env, verifier in _VERIFIERS:
+        try:
+            payload = verifier.verify_and_decode_signed_transaction(jws)
+            log.info(
+                "validate-receipt: JWS verified env=%s productId=%s txId=%s",
+                env.value,
+                getattr(payload, "productId", "?"),
+                getattr(payload, "transactionId", "?"),
+            )
+            return payload
+        except VerificationException as e:
+            last_error = e
+            log.debug("validate-receipt: env=%s rejected: %s", env.value, e)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(APPLE_PROD_URL, json=payload)
-        data = r.json()
-        # 21007 → this is a sandbox receipt, retry against sandbox URL
-        if data.get("status") == 21007:
-            log.info("validate-receipt: 21007 from prod, retrying sandbox")
-            r = await client.post(APPLE_SANDBOX_URL, json=payload)
-            data = r.json()
-
-    status = data.get("status")
-    if status != 0:
-        log.error(
-            "validate-receipt: Apple status=%s receipt_prefix=%s",
-            status,
-            receipt_b64[:24],
-        )
-        raise HTTPException(status_code=400, detail=f"Apple receipt status {status}")
-
-    bundle_id = data.get("receipt", {}).get("bundle_id", "")
-    if bundle_id != EXPECTED_BUNDLE_ID:
-        log.error(
-            "validate-receipt: bundle_id mismatch got=%s expected=%s",
-            bundle_id,
-            EXPECTED_BUNDLE_ID,
-        )
-        raise HTTPException(status_code=400, detail="Bundle ID mismatch")
-
-    log.info("validate-receipt: Apple OK, bundle=%s", bundle_id)
-    return data
+    log.error("validate-receipt: JWS verification failed against all envs: %s", last_error)
+    raise HTTPException(status_code=400, detail="Invalid subscription token")
 
 
-def _latest_active_subscription(receipt_data: dict) -> dict:
-    entries = receipt_data.get("latest_receipt_info") or []
-    if not entries:
-        entries = receipt_data.get("receipt", {}).get("in_app", [])
+def _check_active_subscription(payload) -> None:
+    """Enforce that the verified transaction is for one of our products and
+    hasn't expired past the grace window."""
+    product_id = getattr(payload, "productId", "") or ""
+    if product_id not in VALID_PRODUCT_IDS:
+        log.error("validate-receipt: unknown productId=%s", product_id)
+        raise HTTPException(status_code=402, detail="Unsupported product")
 
-    subs = [e for e in entries if e.get("product_id") in VALID_PRODUCT_IDS]
-    if not subs:
-        raise HTTPException(status_code=402, detail="No ClawKeep Pro subscription found")
-
-    subs.sort(key=lambda e: int(e.get("expires_date_ms", 0)), reverse=True)
-    latest = subs[0]
-
-    expires_ms = int(latest.get("expires_date_ms", 0))
+    expires_ms = getattr(payload, "expiresDate", 0) or 0
     now_ms = int(time.time() * 1000)
     grace_ms = 7 * 24 * 60 * 60 * 1000
-    if expires_ms + grace_ms < now_ms:
+    if expires_ms and (expires_ms + grace_ms) < now_ms:
+        log.error(
+            "validate-receipt: expired expires_ms=%s now_ms=%s productId=%s",
+            expires_ms, now_ms, product_id,
+        )
         raise HTTPException(status_code=402, detail="Subscription expired")
-
-    return latest
 
 
 def _mint_jwt(transaction_id: str, product_id: str, sub_expires_ms: int) -> tuple[str, int]:
@@ -214,18 +247,29 @@ def _mint_jwt(transaction_id: str, product_id: str, sub_expires_ms: int) -> tupl
 @app.post("/validate-receipt")
 @limiter.limit("10/minute", key_func=get_remote_address)
 async def validate_receipt(request: Request):
-    """iOS POSTs App Store receipt, gets a per-user JWT in return."""
+    """iOS POSTs a StoreKit 2 signed transaction JWS, gets a per-user JWT back.
+
+    The JWS is produced by iOS via `Transaction.jwsRepresentation` — the
+    transaction payload signed by Apple with a cert chain rooted at
+    AppleRootCA-G3. We verify the signature offline and mint our JWT.
+    """
     body = await request.json()
-    receipt_b64 = body.get("receipt_data")
-    if not receipt_b64:
-        raise HTTPException(status_code=400, detail="Missing receipt_data")
+    jws = body.get("transaction_jws")
+    if not jws or not isinstance(jws, str):
+        raise HTTPException(status_code=400, detail="Missing transaction_jws")
 
-    apple_data = await _verify_apple_receipt(receipt_b64)
-    sub = _latest_active_subscription(apple_data)
+    payload = _verify_transaction_jws(jws)
+    _check_active_subscription(payload)
 
-    transaction_id = sub.get("original_transaction_id", "")
-    product_id = sub.get("product_id", "")
-    expires_ms = int(sub.get("expires_date_ms", 0))
+    # originalTransactionId stays stable across renewals; transactionId changes
+    # every billing period. We scope the JWT's sub to originalTransactionId so
+    # rate-limits and usage tracking don't reset on renewal.
+    transaction_id = str(getattr(payload, "originalTransactionId", "") or "")
+    product_id = str(getattr(payload, "productId", "") or "")
+    expires_ms = int(getattr(payload, "expiresDate", 0) or 0)
+
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="Missing transaction id in signed payload")
 
     token, exp = _mint_jwt(transaction_id, product_id, expires_ms)
     tier = "yearly" if "yearly" in product_id else "monthly"
