@@ -1,10 +1,12 @@
 """
 ClawKeep Pro Proxy
 ==================
-Validates bearer token, forwards /v1/chat/completions to the real AI provider.
-API key lives here only — never shipped in the app.
+Validates per-user JWTs (minted from App Store receipts), forwards
+/v1/chat/completions and /v1/responses to the real AI provider.
+Provider API keys live here only — never shipped in the app.
 
-Config via environment variables (Railway injects these) or local config.env
+Config via environment variables (Railway injects these) or local config.env.
+JWT_SECRET is required; the server refuses to start without it.
 """
 
 import os
@@ -17,6 +19,9 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import jwt
 import uvicorn
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -29,7 +34,6 @@ if CONFIG_PATH.exists():
             k, _, v = line.partition("=")
             os.environ.setdefault(k.strip(), v.strip())
 
-BEARER_TOKEN   = os.environ.get("BEARER_TOKEN", "8166ad8e5221fbef10dcd887e457b3083035a3630003a1b162d9c338f064dbe2")
 AI_PROVIDER    = os.environ.get("AI_PROVIDER", "anthropic")   # anthropic | openai | gemini
 AI_API_KEY     = os.environ.get("AI_API_KEY", "")
 DEFAULT_MODEL  = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
@@ -40,6 +44,12 @@ APPLE_SHARED_SECRET = os.environ.get("APPLE_SHARED_SECRET", "")
 JWT_SECRET          = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM       = "HS256"
 JWT_EXPIRY_DAYS     = 30
+
+if not JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET environment variable is required. "
+        "Generate one with: openssl rand -hex 32"
+    )
 
 APPLE_PROD_URL    = "https://buy.itunes.apple.com/verifyReceipt"
 APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
@@ -65,33 +75,59 @@ log = logging.getLogger("clawproxy")
 
 app = FastAPI(title="ClawKeep Pro Proxy", version="1.0.0")
 
+# ─── Rate limiting ────────────────────────────────────────────────────────────
+
+def _jwt_sub_or_ip(request: Request) -> str:
+    """Rate-limit key: JWT `sub` when the token is valid, else client IP."""
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            sub = payload.get("sub")
+            if sub:
+                return f"sub:{sub}"
+        except jwt.PyJWTError:
+            pass
+    return f"ip:{get_remote_address(request)}"
+
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    log.warning(
+        "rate_limited path=%s key=%s limit=%s",
+        request.url.path,
+        _jwt_sub_or_ip(request) if request.url.path != "/validate-receipt" else f"ip:{get_remote_address(request)}",
+        getattr(exc, "detail", ""),
+    )
+    return JSONResponse(
+        {"error": "rate_limited"},
+        status_code=429,
+        headers={"Retry-After": "60"},
+    )
+
+
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def check_auth(request: Request):
-    """Accept either a valid per-user JWT or the legacy shared token.
-
-    Dual-auth exists during the transition from the shared beta token to
-    per-user JWTs. Once all shipped app builds are minting JWTs from
-    /validate-receipt, the shared token branch can be removed.
-    """
+    """Require a valid per-user JWT signed with JWT_SECRET."""
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if token == BEARER_TOKEN:
-        return
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Unauthorized: token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if JWT_SECRET:
-        try:
-            jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            return
-        except jwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Unauthorized: token expired")
-        except jwt.InvalidTokenError:
-            pass
-
-    raise HTTPException(status_code=401, detail="Unauthorized")
+    request.state.sub = payload.get("sub", "-")
 
 
 # ─── Apple receipt verification + JWT minting ────────────────────────────────
@@ -159,13 +195,12 @@ def _mint_jwt(transaction_id: str, product_id: str, sub_expires_ms: int) -> tupl
         "exp": exp,
         "iat": now,
     }
-    if not JWT_SECRET:
-        raise HTTPException(status_code=500, detail="JWT_SECRET not configured")
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return token, exp
 
 
 @app.post("/validate-receipt")
+@limiter.limit("10/minute", key_func=get_remote_address)
 async def validate_receipt(request: Request):
     """iOS POSTs App Store receipt, gets a per-user JWT in return."""
     body = await request.json()
@@ -194,10 +229,11 @@ async def validate_receipt(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "provider": AI_PROVIDER, "key_set": bool(AI_API_KEY)}
+    return {"status": "ok"}
 
 
 @app.post("/v1/chat/completions")
+@limiter.limit("60/minute", key_func=_jwt_sub_or_ip)
 async def chat_completions(request: Request):
     check_auth(request)
 
@@ -206,12 +242,13 @@ async def chat_completions(request: Request):
     model = body.get("model", DEFAULT_MODEL)
 
     if AI_PROVIDER == "anthropic":
-        return await _forward_anthropic(body, model, stream)
+        return await _forward_anthropic(body, model, stream, request)
     else:
-        return await _forward_openai_compat(body, model, stream)
+        return await _forward_openai_compat(body, model, stream, request)
 
 
 @app.post("/v1/responses")
+@limiter.limit("20/minute", key_func=_jwt_sub_or_ip)
 async def responses(request: Request):
     """
     Passthrough for OpenAI Responses API (required for web_search_preview tool).
@@ -234,20 +271,27 @@ async def responses(request: Request):
     }
 
     if stream:
-        return await _stream_response(OPENAI_RESPONSES_URL, headers, body, "openai")
+        return await _stream_response(OPENAI_RESPONSES_URL, headers, body, "openai", request)
 
     # Responses API calls can be long (web searches take time)
     async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(OPENAI_RESPONSES_URL, headers=headers, json=body)
         if r.status_code != 200:
-            log.error("Responses API error %s: %s", r.status_code, r.text[:300])
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+            _log_upstream_error(request, "responses", r.status_code, r.text)
+            return JSONResponse({"error": "upstream_error"}, status_code=502)
         return JSONResponse(r.json())
+
+
+# ─── Upstream error logging ──────────────────────────────────────────────────
+
+def _log_upstream_error(request: Request, provider: str, status: int, text: str):
+    sub = getattr(request.state, "sub", "-") if request is not None else "-"
+    log.error("upstream_error provider=%s status=%s sub=%s body=%s", provider, status, sub, text[:500])
 
 
 # ─── Anthropic forwarding ─────────────────────────────────────────────────────
 
-async def _forward_anthropic(body: dict, model: str, stream: bool):
+async def _forward_anthropic(body: dict, model: str, stream: bool, request: Request):
     """Convert OpenAI-style request → Anthropic Messages API."""
     messages = body.get("messages", [])
     system_msgs = [m["content"] for m in messages if m["role"] == "system"]
@@ -269,13 +313,13 @@ async def _forward_anthropic(body: dict, model: str, stream: bool):
     }
 
     if stream:
-        return await _stream_response(PROVIDER_URLS["anthropic"], headers, anthropic_body, "anthropic")
+        return await _stream_response(PROVIDER_URLS["anthropic"], headers, anthropic_body, "anthropic", request)
 
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(PROVIDER_URLS["anthropic"], headers=headers, json=anthropic_body)
         if r.status_code != 200:
-            log.error("Anthropic error %s: %s", r.status_code, r.text[:300])
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+            _log_upstream_error(request, "anthropic", r.status_code, r.text)
+            return JSONResponse({"error": "upstream_error"}, status_code=502)
 
         data = r.json()
         # Convert Anthropic response → OpenAI-compatible shape
@@ -295,7 +339,7 @@ async def _forward_anthropic(body: dict, model: str, stream: bool):
 
 # ─── OpenAI-compatible forwarding (OpenAI / Gemini) ──────────────────────────
 
-async def _forward_openai_compat(body: dict, model: str, stream: bool):
+async def _forward_openai_compat(body: dict, model: str, stream: bool, request: Request):
     url = PROVIDER_URLS.get(AI_PROVIDER, PROVIDER_URLS["openai"])
     headers = {
         "Authorization": f"Bearer {AI_API_KEY}",
@@ -303,22 +347,27 @@ async def _forward_openai_compat(body: dict, model: str, stream: bool):
     }
 
     if stream:
-        return await _stream_response(url, headers, body, "openai")
+        return await _stream_response(url, headers, body, "openai", request)
 
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(url, headers=headers, json=body)
         if r.status_code != 200:
-            log.error("Provider error %s: %s", r.status_code, r.text[:300])
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+            _log_upstream_error(request, AI_PROVIDER, r.status_code, r.text)
+            return JSONResponse({"error": "upstream_error"}, status_code=502)
         return JSONResponse(r.json())
 
 
 # ─── Streaming ────────────────────────────────────────────────────────────────
 
-async def _stream_response(url: str, headers: dict, body: dict, provider: str):
+async def _stream_response(url: str, headers: dict, body: dict, provider: str, request: Request):
     async def generate():
         async with httpx.AsyncClient(timeout=90) as client:
             async with client.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code >= 400:
+                    err_body = await r.aread()
+                    _log_upstream_error(request, provider, r.status_code, err_body.decode("utf-8", errors="replace"))
+                    yield b'data: {"error":"upstream_error"}\n\n'
+                    return
                 async for chunk in r.aiter_bytes():
                     yield chunk
 
