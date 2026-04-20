@@ -147,17 +147,29 @@ async def _verify_apple_receipt(receipt_b64: str) -> dict:
         data = r.json()
         # 21007 → this is a sandbox receipt, retry against sandbox URL
         if data.get("status") == 21007:
+            log.info("validate-receipt: 21007 from prod, retrying sandbox")
             r = await client.post(APPLE_SANDBOX_URL, json=payload)
             data = r.json()
 
     status = data.get("status")
     if status != 0:
+        log.error(
+            "validate-receipt: Apple status=%s receipt_prefix=%s",
+            status,
+            receipt_b64[:24],
+        )
         raise HTTPException(status_code=400, detail=f"Apple receipt status {status}")
 
     bundle_id = data.get("receipt", {}).get("bundle_id", "")
     if bundle_id != EXPECTED_BUNDLE_ID:
+        log.error(
+            "validate-receipt: bundle_id mismatch got=%s expected=%s",
+            bundle_id,
+            EXPECTED_BUNDLE_ID,
+        )
         raise HTTPException(status_code=400, detail="Bundle ID mismatch")
 
+    log.info("validate-receipt: Apple OK, bundle=%s", bundle_id)
     return data
 
 
