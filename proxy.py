@@ -49,6 +49,13 @@ JWT_SECRET          = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM       = "HS256"
 JWT_EXPIRY_DAYS     = 30
 
+# Shared TestFlight bearer — beta testers don't have purchased subscriptions,
+# so they can't mint a per-user JWT via /validate-receipt. The app falls back
+# to this token when isTestFlight && JWT empty. Leave unset to disable the
+# bypass entirely (production hardening). Rate-limited per-IP, not per-sub,
+# since every TestFlight tester sends the same sub identifier.
+TESTFLIGHT_BEARER   = os.environ.get("TESTFLIGHT_BEARER", "")
+
 if not JWT_SECRET:
     raise RuntimeError(
         "JWT_SECRET environment variable is required. "
@@ -127,10 +134,14 @@ app = FastAPI(title="ClawKeep Pro Proxy", version="1.0.0")
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 
 def _jwt_sub_or_ip(request: Request) -> str:
-    """Rate-limit key: JWT `sub` when the token is valid, else client IP."""
+    """Rate-limit key: JWT `sub` when the token is valid, else client IP.
+    TestFlight shared-token requests always rate-limit by IP since every tester
+    sends the same token (no per-user identity)."""
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if token:
+        if TESTFLIGHT_BEARER and token == TESTFLIGHT_BEARER:
+            return f"ip:{get_remote_address(request)}"
         try:
             payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
             sub = payload.get("sub")
@@ -163,11 +174,21 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def check_auth(request: Request):
-    """Require a valid per-user JWT signed with JWT_SECRET."""
+    """Require a valid per-user JWT signed with JWT_SECRET.
+
+    Also accepts the shared TESTFLIGHT_BEARER token (when configured) so beta
+    testers without a purchased subscription can still use Pro features.
+    The TestFlight path doesn't carry per-user identity — it's identified in
+    logs and rate-limit keys as `testflight-shared`.
+    """
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if TESTFLIGHT_BEARER and token == TESTFLIGHT_BEARER:
+        request.state.sub = "testflight-shared"
+        return
 
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
