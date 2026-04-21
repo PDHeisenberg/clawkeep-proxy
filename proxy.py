@@ -489,6 +489,9 @@ async def health():
 @app.post("/research")
 @limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
 async def start_research(request: Request):
+    """Pro-mode research. Proxy uses its own AI_API_KEY for the upstream call.
+    Internally just a thin wrapper around the generic worker, hardcoded to
+    OpenAI Responses API."""
     check_auth(request)
     sub = request.state.sub
 
@@ -502,11 +505,87 @@ async def start_research(request: Request):
     job_id = str(uuid.uuid4())
     await job_store.create(job_id, sub, body)
 
-    task = asyncio.create_task(_run_research_job(job_id, body))
+    upstream_headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    task = asyncio.create_task(_run_research_job_generic(
+        job_id=job_id,
+        body=body,
+        upstream_url=OPENAI_RESPONSES_URL,
+        upstream_headers=upstream_headers,
+        provider="openai",
+    ))
     job_store.register_worker(job_id, task)
 
-    log.info("research_start sub=%s job=%s", sub, job_id)
+    log.info("research_start sub=%s job=%s provider=openai", sub, job_id)
     return JSONResponse({"job_id": job_id, "status": "pending"})
+
+
+@app.post("/research/passthrough")
+@limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
+async def start_research_passthrough(request: Request):
+    """Direct-API-mode research. Caller supplies their OWN provider URL +
+    auth headers; proxy uses those for the upstream call instead of our
+    AI_API_KEY. The user's key passes through proxy memory only — never
+    written to disk, never logged, scrubbed when the worker exits.
+
+    Body shape:
+      {
+        "upstream_url": "https://api.openai.com/v1/responses",
+        "upstream_headers": {"Authorization": "Bearer sk-...", "Content-Type": "application/json"},
+        "request_body": { ...the original provider request body... }
+      }
+
+    Provider auto-detected from URL — OpenAI gets streaming + progress,
+    Anthropic/Gemini/custom get reliability via the polling shape but
+    no live progress events (different streaming formats; deferred)."""
+    check_auth(request)
+    sub = request.state.sub
+
+    body = await request.json()
+    upstream_url = body.get("upstream_url")
+    upstream_headers = body.get("upstream_headers") or {}
+    request_body = body.get("request_body")
+
+    if not upstream_url or not isinstance(upstream_url, str):
+        raise HTTPException(status_code=400, detail="Missing upstream_url")
+    if request_body is None:
+        raise HTTPException(status_code=400, detail="Missing request_body")
+    if not isinstance(upstream_headers, dict):
+        raise HTTPException(status_code=400, detail="upstream_headers must be a dict")
+
+    provider = _detect_provider(upstream_url)
+    job_id = str(uuid.uuid4())
+    # We persist request_body for diagnostics (it's the prompt payload — not
+    # secret). upstream_headers stays out of JobStore entirely; it lives only
+    # in the worker task's local scope and is GC'd when the task exits.
+    await job_store.create(job_id, sub, request_body)
+
+    task = asyncio.create_task(_run_research_job_generic(
+        job_id=job_id,
+        body=request_body,
+        upstream_url=upstream_url,
+        upstream_headers=upstream_headers,
+        provider=provider,
+    ))
+    job_store.register_worker(job_id, task)
+
+    log.info("research_passthrough_start sub=%s job=%s provider=%s", sub, job_id, provider)
+    return JSONResponse({"job_id": job_id, "status": "pending"})
+
+
+def _detect_provider(url: str) -> str:
+    """Identify provider from upstream URL so the worker picks the right
+    request handling strategy (streaming for OpenAI, plain POST otherwise)."""
+    lower = url.lower()
+    if "openai.com" in lower or "/v1/responses" in lower or "/v1/chat/completions" in lower:
+        return "openai"
+    if "anthropic.com" in lower:
+        return "anthropic"
+    if "googleapis.com" in lower or "generativelanguage" in lower:
+        return "gemini"
+    return "custom"
 
 
 @app.get("/research/{job_id}")
@@ -551,12 +630,22 @@ async def cancel_research(request: Request, job_id: str):
     return JSONResponse({"id": job_id, "status": "cancelled"})
 
 
-async def _run_research_job(job_id: str, body: dict):
-    """The actual long-running work — streams the OpenAI Responses API and
-    captures progress events (web_search calls, text generation) so iOS
-    can show the user what's actually happening instead of an opaque
-    spinner. The final response object arrives in the
-    `response.completed` event and is what gets stored as the job result.
+async def _run_research_job_generic(
+    job_id: str,
+    body: dict,
+    upstream_url: str,
+    upstream_headers: dict,
+    provider: str,
+):
+    """Provider-aware research worker. OpenAI gets streaming + per-event
+    progress capture so iOS can show "Searching: <query>" in the UI.
+    Anthropic/Gemini/custom get a plain non-streaming POST — same job-queue
+    polling reliability, just no live activity readout (each provider
+    streams differently; we wire those parsers in a follow-up).
+
+    `upstream_headers` is held only in this function's local scope. When
+    the task exits (success/cancel/error), Python's GC drops the reference
+    and the user's API key (if it was in there) is gone.
 
     Runs as a background asyncio task. Cancellation propagates from
     job_store.cancel() via task.cancel()."""
@@ -567,134 +656,191 @@ async def _run_research_job(job_id: str, body: dict):
             progress={"phase": "starting"},
         )
 
-        headers = {
-            "Authorization": f"Bearer {AI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        # Force streaming on so we get tool-call progress events. iOS doesn't
-        # consume the stream directly — we parse it server-side and surface
-        # the current activity through the polling API.
-        body["stream"] = True
-
-        full_response: dict | None = None
-        searches_total = 0
-        searches_done = 0
-        current_query: str | None = None
-        text_started = False
-
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream("POST", OPENAI_RESPONSES_URL, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err_body = (await r.aread()).decode("utf-8", errors="replace")[:500]
-                    log.error("research_job_upstream_error job=%s status=%s body=%s", job_id, r.status_code, err_body)
-                    # Pull a friendly snippet out of the upstream JSON if possible
-                    msg = f"Upstream error: HTTP {r.status_code}"
-                    try:
-                        err_json = json.loads(err_body)
-                        if isinstance(err_json, dict) and isinstance(err_json.get("error"), dict):
-                            inner = err_json["error"].get("message")
-                            if inner:
-                                msg = f"{msg} — {inner[:150]}"
-                    except Exception:
-                        pass
-                    await job_store.update(job_id, status="failed", error=msg)
-                    return
-
-                async for line in r.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    payload = line[6:]
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-
-                    event_type = event.get("type", "")
-
-                    if event_type == "response.output_item.added":
-                        item = event.get("item") or {}
-                        if item.get("type") == "web_search_call":
-                            searches_total += 1
-                            action = item.get("action") or {}
-                            q = action.get("query")
-                            if not q and isinstance(action.get("queries"), list):
-                                q = action["queries"][0] if action["queries"] else None
-                            current_query = q
-                            await job_store.update(job_id, progress={
-                                "phase": "searching",
-                                "current_query": current_query,
-                                "searches_done": searches_done,
-                                "searches_total": searches_total,
-                            })
-
-                    elif event_type == "response.web_search_call.completed":
-                        searches_done += 1
-                        current_query = None
-                        await job_store.update(job_id, progress={
-                            "phase": "searching",
-                            "current_query": None,
-                            "searches_done": searches_done,
-                            "searches_total": searches_total,
-                        })
-
-                    elif event_type == "response.output_text.delta":
-                        # First text delta means search phase is done and the
-                        # model is now writing the report. Don't update on every
-                        # delta — those fire dozens of times per second.
-                        if not text_started:
-                            text_started = True
-                            await job_store.update(job_id, progress={
-                                "phase": "writing",
-                                "searches_done": searches_done,
-                                "searches_total": searches_total,
-                            })
-
-                    elif event_type == "response.completed":
-                        full_response = event.get("response")
-                        # Don't break — let the stream end naturally so any
-                        # final events are processed. Loop will exit on its own.
-
-                    elif event_type == "response.failed":
-                        err_obj = (event.get("response") or {}).get("error") or {}
-                        err_msg = err_obj.get("message") or "Stream reported failure"
-                        await job_store.update(job_id, status="failed", error=err_msg[:200])
-                        return
-
-        if full_response is None:
-            await job_store.update(
-                job_id,
-                status="failed",
-                error="Stream ended without response.completed event",
-            )
-            log.error("research_job_no_completion job=%s searches_done=%s searches_total=%s", job_id, searches_done, searches_total)
-            return
-
-        await job_store.update(
-            job_id,
-            status="completed",
-            response=full_response,
-            progress={
-                "phase": "done",
-                "searches_done": searches_done,
-                "searches_total": searches_total,
-            },
-        )
-        log.info(
-            "research_job_complete job=%s searches=%d/%d",
-            job_id, searches_done, searches_total,
-        )
+        if provider == "openai":
+            await _run_openai_streaming(job_id, body, upstream_url, upstream_headers)
+        else:
+            await _run_simple_call(job_id, body, upstream_url, upstream_headers, provider)
 
     except asyncio.CancelledError:
         await job_store.update(job_id, status="cancelled", error="Cancelled by client")
         log.info("research_job_cancelled job=%s", job_id)
         raise
     except Exception as e:
-        log.exception("research_job_error job=%s", job_id)
+        log.exception("research_job_error job=%s provider=%s", job_id, provider)
         await job_store.update(job_id, status="failed", error=str(e)[:200])
     finally:
         job_store.unregister_worker(job_id)
+
+
+def _extract_upstream_error(status: int, body_text: str) -> str:
+    """Pull a friendly inner message out of an upstream error body. Falls
+    back to a generic HTTP status string when the body isn't JSON or
+    doesn't have the expected shape."""
+    msg = f"Upstream error: HTTP {status}"
+    try:
+        err_json = json.loads(body_text)
+        if isinstance(err_json, dict):
+            err_obj = err_json.get("error")
+            if isinstance(err_obj, dict):
+                inner = err_obj.get("message")
+                if inner:
+                    return f"{msg} — {inner[:150]}"
+            elif isinstance(err_obj, str):
+                return f"{msg} — {err_obj[:150]}"
+    except Exception:
+        pass
+    return msg
+
+
+async def _run_openai_streaming(job_id: str, body: dict, url: str, headers: dict):
+    """Streaming variant — only OpenAI Responses API today. Captures
+    web_search and text-generation events, surfaces progress through
+    job_store.update so the iOS skeleton can narrate the call."""
+    body["stream"] = True
+
+    full_response: dict | None = None
+    searches_total = 0
+    searches_done = 0
+    current_query: str | None = None
+    text_started = False
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as r:
+            if r.status_code != 200:
+                err_body = (await r.aread()).decode("utf-8", errors="replace")[:500]
+                log.error("research_job_upstream_error job=%s status=%s", job_id, r.status_code)
+                await job_store.update(
+                    job_id,
+                    status="failed",
+                    error=_extract_upstream_error(r.status_code, err_body),
+                )
+                return
+
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                if event_type == "response.output_item.added":
+                    item = event.get("item") or {}
+                    if item.get("type") == "web_search_call":
+                        searches_total += 1
+                        action = item.get("action") or {}
+                        q = action.get("query")
+                        if not q and isinstance(action.get("queries"), list):
+                            q = action["queries"][0] if action["queries"] else None
+                        current_query = q
+                        await job_store.update(job_id, progress={
+                            "phase": "searching",
+                            "current_query": current_query,
+                            "searches_done": searches_done,
+                            "searches_total": searches_total,
+                        })
+
+                elif event_type == "response.web_search_call.completed":
+                    searches_done += 1
+                    current_query = None
+                    await job_store.update(job_id, progress={
+                        "phase": "searching",
+                        "current_query": None,
+                        "searches_done": searches_done,
+                        "searches_total": searches_total,
+                    })
+
+                elif event_type == "response.output_text.delta":
+                    # First text delta means search phase is done and the
+                    # model is now writing the report. Don't update on every
+                    # delta — those fire dozens of times per second.
+                    if not text_started:
+                        text_started = True
+                        await job_store.update(job_id, progress={
+                            "phase": "writing",
+                            "searches_done": searches_done,
+                            "searches_total": searches_total,
+                        })
+
+                elif event_type == "response.completed":
+                    full_response = event.get("response")
+                    # Don't break — let the stream end naturally so any
+                    # final events are processed. Loop will exit on its own.
+
+                elif event_type == "response.failed":
+                    err_obj = (event.get("response") or {}).get("error") or {}
+                    err_msg = err_obj.get("message") or "Stream reported failure"
+                    await job_store.update(job_id, status="failed", error=err_msg[:200])
+                    return
+
+    if full_response is None:
+        await job_store.update(
+            job_id,
+            status="failed",
+            error="Stream ended without response.completed event",
+        )
+        log.error(
+            "research_job_no_completion job=%s searches_done=%s searches_total=%s",
+            job_id, searches_done, searches_total,
+        )
+        return
+
+    await job_store.update(
+        job_id,
+        status="completed",
+        response=full_response,
+        progress={
+            "phase": "done",
+            "searches_done": searches_done,
+            "searches_total": searches_total,
+        },
+    )
+    log.info(
+        "research_job_complete job=%s searches=%d/%d",
+        job_id, searches_done, searches_total,
+    )
+
+
+async def _run_simple_call(job_id: str, body: dict, url: str, headers: dict, provider: str):
+    """Non-streaming variant — Anthropic/Gemini/custom. The caller still
+    polls and gets the same reliability properties, just no per-event
+    progress events because each provider's streaming format is different
+    enough to need its own parser. iOS surfaces a static "running" state
+    until the call returns."""
+    # Strip stream:true if the caller set it — we want the full response in one shot.
+    body.pop("stream", None)
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(url, headers=headers, json=body)
+
+    if r.status_code != 200:
+        err_body = r.text[:500]
+        log.error("research_job_upstream_error job=%s provider=%s status=%s", job_id, provider, r.status_code)
+        await job_store.update(
+            job_id,
+            status="failed",
+            error=_extract_upstream_error(r.status_code, err_body),
+        )
+        return
+
+    try:
+        result = r.json()
+    except Exception:
+        await job_store.update(job_id, status="failed", error="Upstream returned non-JSON response")
+        return
+
+    await job_store.update(
+        job_id,
+        status="completed",
+        response=result,
+        progress={"phase": "done"},
+    )
+    log.info("research_job_complete job=%s provider=%s", job_id, provider)
 
 
 @app.post("/v1/chat/completions")
