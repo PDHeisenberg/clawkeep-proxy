@@ -341,6 +341,7 @@ class JobStore:
                 "request_body": request_body,
                 "response": None,
                 "error": None,
+                "progress": None,    # {phase, current_query, searches_done, searches_total}
                 "created_at": now,
                 "updated_at": now,
             }
@@ -351,6 +352,7 @@ class JobStore:
         status: str | None = None,
         response: dict | None = None,
         error: str | None = None,
+        progress: dict | None = None,
     ) -> None:
         async with self._lock:
             job = self._jobs.get(job_id)
@@ -362,6 +364,8 @@ class JobStore:
                 job["response"] = response
             if error is not None:
                 job["error"] = error
+            if progress is not None:
+                job["progress"] = progress
             job["updated_at"] = time.time()
 
     async def get(self, job_id: str, sub: str) -> dict | None:
@@ -437,6 +441,7 @@ def _public_job_view(job: dict) -> dict:
         "status": job["status"],
         "response": job["response"],
         "error": job["error"],
+        "progress": job.get("progress"),
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
     }
@@ -547,36 +552,139 @@ async def cancel_research(request: Request, job_id: str):
 
 
 async def _run_research_job(job_id: str, body: dict):
-    """The actual long-running work — POSTs to OpenAI's Responses API and
-    stores the result. Runs as a background asyncio task. Cancellation
-    propagates from job_store.cancel() via task.cancel()."""
+    """The actual long-running work — streams the OpenAI Responses API and
+    captures progress events (web_search calls, text generation) so iOS
+    can show the user what's actually happening instead of an opaque
+    spinner. The final response object arrives in the
+    `response.completed` event and is what gets stored as the job result.
+
+    Runs as a background asyncio task. Cancellation propagates from
+    job_store.cancel() via task.cancel()."""
     try:
-        await job_store.update(job_id, status="running")
+        await job_store.update(
+            job_id,
+            status="running",
+            progress={"phase": "starting"},
+        )
 
         headers = {
             "Authorization": f"Bearer {AI_API_KEY}",
             "Content-Type": "application/json",
         }
-        # Force non-streaming — we want the complete response in one shot
-        # so we can store it. iOS gets the result via polling, not stream.
-        body.pop("stream", None)
+        # Force streaming on so we get tool-call progress events. iOS doesn't
+        # consume the stream directly — we parse it server-side and surface
+        # the current activity through the polling API.
+        body["stream"] = True
+
+        full_response: dict | None = None
+        searches_total = 0
+        searches_done = 0
+        current_query: str | None = None
+        text_started = False
 
         async with httpx.AsyncClient(timeout=300) as client:
-            r = await client.post(OPENAI_RESPONSES_URL, headers=headers, json=body)
+            async with client.stream("POST", OPENAI_RESPONSES_URL, headers=headers, json=body) as r:
+                if r.status_code != 200:
+                    err_body = (await r.aread()).decode("utf-8", errors="replace")[:500]
+                    log.error("research_job_upstream_error job=%s status=%s body=%s", job_id, r.status_code, err_body)
+                    # Pull a friendly snippet out of the upstream JSON if possible
+                    msg = f"Upstream error: HTTP {r.status_code}"
+                    try:
+                        err_json = json.loads(err_body)
+                        if isinstance(err_json, dict) and isinstance(err_json.get("error"), dict):
+                            inner = err_json["error"].get("message")
+                            if inner:
+                                msg = f"{msg} — {inner[:150]}"
+                    except Exception:
+                        pass
+                    await job_store.update(job_id, status="failed", error=msg)
+                    return
 
-        if r.status_code != 200:
-            err_body = r.text[:500]
-            log.error("research_job_upstream_error job=%s status=%s body=%s", job_id, r.status_code, err_body)
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    payload = line[6:]
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+
+                    event_type = event.get("type", "")
+
+                    if event_type == "response.output_item.added":
+                        item = event.get("item") or {}
+                        if item.get("type") == "web_search_call":
+                            searches_total += 1
+                            action = item.get("action") or {}
+                            q = action.get("query")
+                            if not q and isinstance(action.get("queries"), list):
+                                q = action["queries"][0] if action["queries"] else None
+                            current_query = q
+                            await job_store.update(job_id, progress={
+                                "phase": "searching",
+                                "current_query": current_query,
+                                "searches_done": searches_done,
+                                "searches_total": searches_total,
+                            })
+
+                    elif event_type == "response.web_search_call.completed":
+                        searches_done += 1
+                        current_query = None
+                        await job_store.update(job_id, progress={
+                            "phase": "searching",
+                            "current_query": None,
+                            "searches_done": searches_done,
+                            "searches_total": searches_total,
+                        })
+
+                    elif event_type == "response.output_text.delta":
+                        # First text delta means search phase is done and the
+                        # model is now writing the report. Don't update on every
+                        # delta — those fire dozens of times per second.
+                        if not text_started:
+                            text_started = True
+                            await job_store.update(job_id, progress={
+                                "phase": "writing",
+                                "searches_done": searches_done,
+                                "searches_total": searches_total,
+                            })
+
+                    elif event_type == "response.completed":
+                        full_response = event.get("response")
+                        # Don't break — let the stream end naturally so any
+                        # final events are processed. Loop will exit on its own.
+
+                    elif event_type == "response.failed":
+                        err_obj = (event.get("response") or {}).get("error") or {}
+                        err_msg = err_obj.get("message") or "Stream reported failure"
+                        await job_store.update(job_id, status="failed", error=err_msg[:200])
+                        return
+
+        if full_response is None:
             await job_store.update(
                 job_id,
                 status="failed",
-                error=f"Upstream error: HTTP {r.status_code}",
+                error="Stream ended without response.completed event",
             )
+            log.error("research_job_no_completion job=%s searches_done=%s searches_total=%s", job_id, searches_done, searches_total)
             return
 
-        result = r.json()
-        await job_store.update(job_id, status="completed", response=result)
-        log.info("research_job_complete job=%s", job_id)
+        await job_store.update(
+            job_id,
+            status="completed",
+            response=full_response,
+            progress={
+                "phase": "done",
+                "searches_done": searches_done,
+                "searches_total": searches_total,
+            },
+        )
+        log.info(
+            "research_job_complete job=%s searches=%d/%d",
+            job_id, searches_done, searches_total,
+        )
 
     except asyncio.CancelledError:
         await job_store.update(job_id, status="cancelled", error="Cancelled by client")
