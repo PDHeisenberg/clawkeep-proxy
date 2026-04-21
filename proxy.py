@@ -830,10 +830,48 @@ async def _run_openai_streaming(job_id: str, body: dict, url: str, headers: dict
                     # Don't break — let the stream end naturally so any
                     # final events are processed. Loop will exit on its own.
 
+                elif event_type == "response.incomplete":
+                    # Output truncated (typically max_output_tokens, sometimes
+                    # content_filter or stop). The response object IS in the
+                    # event payload — just with status="incomplete" and an
+                    # incomplete_details field. Treat as success: a partial
+                    # report is way better than failing the whole job, which
+                    # was happening for any research call that did 20+ web
+                    # searches because the accumulating context overran the
+                    # output budget.
+                    full_response = event.get("response")
+                    incomplete_reason = (
+                        (full_response or {}).get("incomplete_details") or {}
+                    ).get("reason", "unknown")
+                    log.warning(
+                        "research_job_incomplete job=%s reason=%s searches=%d/%d",
+                        job_id, incomplete_reason, searches_done, searches_total,
+                    )
+                    # Don't break — let the stream end naturally.
+
                 elif event_type == "response.failed":
                     err_obj = (event.get("response") or {}).get("error") or {}
                     err_msg = err_obj.get("message") or "Stream reported failure"
                     await job_store.update(job_id, status="failed", error=err_msg[:200])
+                    return
+
+                elif event_type == "response.cancelled":
+                    # Server-side cancellation (rare — usually when a user
+                    # cancels via the OpenAI dashboard or the request got
+                    # aborted upstream). Treat as cancelled rather than
+                    # failed so iOS doesn't show a "Tap retry" pill.
+                    await job_store.update(
+                        job_id, status="cancelled",
+                        error="Cancelled upstream",
+                    )
+                    return
+
+                elif event_type == "error":
+                    # Top-level stream error (not wrapped in a response object).
+                    # Surfaces things like rate-limit errors that fire mid-stream.
+                    err_msg = event.get("message") or "Stream error"
+                    log.error("research_job_stream_error job=%s msg=%s", job_id, err_msg)
+                    await job_store.update(job_id, status="failed", error=str(err_msg)[:200])
                     return
 
     if full_response is None:
