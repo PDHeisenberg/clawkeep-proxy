@@ -378,6 +378,32 @@ class JobStore:
                 return None
             return _public_job_view(job)
 
+    async def get_by_id_only(self, job_id: str) -> dict | None:
+        """Fetch a job by UUID alone — no sub check. Used by the public
+        polling endpoint where the UUID acts as a capability token. The
+        UUID is unguessable (122 bits of randomness); its possession is
+        sufficient proof that the requester is the original creator (or
+        someone the creator legitimately shared it with)."""
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            return _public_job_view(job) if job is not None else None
+
+    async def cancel_by_id_only(self, job_id: str) -> bool:
+        """Cancel by UUID alone — same capability-token model as
+        get_by_id_only. Returns True if cancelled, False if not found
+        or already terminal."""
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job["status"] not in ("pending", "running"):
+                return False
+            job["status"] = "cancelled"
+            job["updated_at"] = time.time()
+
+        worker = self._workers.pop(job_id, None)
+        if worker is not None and not worker.done():
+            worker.cancel()
+        return True
+
     async def list_active(self, sub: str) -> list[dict]:
         """All jobs for this sub that are pending/running, plus completed/
         failed ones updated within the last 60s (so iOS catches the
@@ -523,12 +549,21 @@ async def start_research(request: Request):
 
 
 @app.post("/research/passthrough")
-@limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
+@limiter.limit("30/minute", key_func=lambda r: f"ip:{get_remote_address(r)}")
 async def start_research_passthrough(request: Request):
     """Direct-API-mode research. Caller supplies their OWN provider URL +
     auth headers; proxy uses those for the upstream call instead of our
     AI_API_KEY. The user's key passes through proxy memory only — never
     written to disk, never logged, scrubbed when the worker exits.
+
+    NO AUTH REQUIRED. This is safe by construction: the endpoint takes
+    `upstream_url` and `upstream_headers` from the request body and uses
+    THOSE for the upstream call. It never reads `AI_API_KEY`, so it
+    cannot be exploited to grant Pro access — the path that uses our
+    key is in the separate `/research` handler which still requires JWT.
+    Anyone hitting this endpoint pays their own provider for their own
+    tokens; our cost is just compute for relaying. Per-IP rate limit
+    bounds compute exposure.
 
     Body shape:
       {
@@ -540,8 +575,23 @@ async def start_research_passthrough(request: Request):
     Provider auto-detected from URL — OpenAI gets streaming + progress,
     Anthropic/Gemini/custom get reliability via the polling shape but
     no live progress events (different streaming formats; deferred)."""
-    check_auth(request)
-    sub = request.state.sub
+    # Try to identify the caller for nicer log lines, but don't reject
+    # them if they're anonymous. Pro JWTs and TestFlight bearers still
+    # show up in logs as their proper sub identifier; everyone else is
+    # logged as "anonymous-{ip-prefix}" so we can grep.
+    sub = "anonymous"
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if token:
+        if TESTFLIGHT_BEARER and token == TESTFLIGHT_BEARER:
+            sub = "testflight-shared"
+        else:
+            try:
+                payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                sub = payload.get("sub", "anonymous")
+            except jwt.PyJWTError:
+                pass  # Stays "anonymous" — invalid token is fine here
+    request.state.sub = sub
 
     body = await request.json()
     upstream_url = body.get("upstream_url")
@@ -589,15 +639,21 @@ def _detect_provider(url: str) -> str:
 
 
 @app.get("/research/{job_id}")
-@limiter.limit("120/minute", key_func=_jwt_sub_or_ip)
+@limiter.limit("120/minute", key_func=lambda r: f"ip:{get_remote_address(r)}")
 async def get_research(request: Request, job_id: str):
-    """Poll for status. Tiny response when running (just status), full
-    response payload when completed. Higher rate limit because polling
-    is the expected access pattern."""
-    check_auth(request)
-    sub = request.state.sub
+    """Poll for status. Tiny response when running, full response payload
+    when completed.
 
-    job = await job_store.get(job_id, sub)
+    NO AUTH. The job_id is a UUID v4 — 122 bits of randomness, effectively
+    unguessable. Anyone with the UUID can read the job; you only get the
+    UUID by being the caller who started the job (it's in the response to
+    POST /research[/passthrough]). This sidesteps the question of "who
+    can poll a passthrough job created with no auth" — the answer is
+    "whoever has the UUID", and the UUID acts as a one-shot capability
+    token. If a UUID leaks (logs, etc.), worst case someone reads someone
+    else's research result, which is not a meaningful privacy leak — these
+    are saved-link summaries, not user secrets."""
+    job = await job_store.get_by_id_only(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -617,16 +673,18 @@ async def list_research(request: Request):
 
 
 @app.delete("/research/{job_id}")
-@limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
+@limiter.limit("30/minute", key_func=lambda r: f"ip:{get_remote_address(r)}")
 async def cancel_research(request: Request, job_id: str):
-    check_auth(request)
-    sub = request.state.sub
-    cancelled = await job_store.cancel(job_id, sub)
+    """Cancel a job. Same UUID-as-capability auth model as GET — no
+    JWT required, the UUID is the access control. The biggest harm a
+    leaked UUID could do is cancelling someone else's research; cheap
+    annoyance, not a security incident."""
+    cancelled = await job_store.cancel_by_id_only(job_id)
     if not cancelled:
         # 404 covers both "doesn't exist" and "already completed"; iOS
         # treats both the same way (no further polling needed).
         raise HTTPException(status_code=404, detail="Job not found or already completed")
-    log.info("research_cancel sub=%s job=%s", sub, job_id)
+    log.info("research_cancel job=%s", job_id)
     return JSONResponse({"id": job_id, "status": "cancelled"})
 
 
