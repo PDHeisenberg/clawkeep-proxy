@@ -5,12 +5,21 @@ Validates per-user JWTs (minted from App Store receipts), forwards
 /v1/chat/completions and /v1/responses to the real AI provider.
 Provider API keys live here only — never shipped in the app.
 
+Also exposes a job-based research API (/research, /research/{id}) so iOS
+can fire a long-running request and poll for the result instead of
+holding an open connection for 1-3 minutes (which iOS network stack
+struggles with). The job worker runs the actual provider call in the
+background; iOS just polls a tiny status endpoint.
+
 Config via environment variables (Railway injects these) or local config.env.
 JWT_SECRET is required; the server refuses to start without it.
 """
 
 import os
 import time
+import json
+import uuid
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -302,11 +311,282 @@ async def validate_receipt(request: Request):
         "tier": tier,
     })
 
+# ─── Job Store (in-memory, ephemeral) ────────────────────────────────────────
+#
+# Backs the polling-based research API. Jobs live for the lifetime of the
+# container — Railway redeploys lose in-flight research, which is acceptable:
+# a research job runs for 1-3 minutes, redeploys are minutes apart, and a
+# lost job surfaces as "failed" on the iOS side and the user retries.
+# Persistence (SQLite + Railway Volume) is a future upgrade if we see this
+# matter in practice. Cleaned up after 1 hour to keep memory bounded.
+
+JOB_TTL_SECONDS = 3600         # Drop completed/failed jobs after 1 hour
+JOB_MAX_AGE_SECONDS = 7200     # Hard TTL even for stuck jobs
+
+class JobStore:
+    """Thread-safe in-memory store for research jobs. All methods async-safe."""
+
+    def __init__(self):
+        self._jobs: dict[str, dict] = {}
+        self._workers: dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
+
+    async def create(self, job_id: str, sub: str, request_body: dict) -> None:
+        now = time.time()
+        async with self._lock:
+            self._jobs[job_id] = {
+                "id": job_id,
+                "sub": sub,
+                "status": "pending",
+                "request_body": request_body,
+                "response": None,
+                "error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+    async def update(
+        self,
+        job_id: str,
+        status: str | None = None,
+        response: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            if status is not None:
+                job["status"] = status
+            if response is not None:
+                job["response"] = response
+            if error is not None:
+                job["error"] = error
+            job["updated_at"] = time.time()
+
+    async def get(self, job_id: str, sub: str) -> dict | None:
+        """Fetch a job, scoped to the requesting sub. Returns None for
+        unknown jobs OR jobs belonging to a different sub (404, not 403,
+        on purpose — don't leak existence)."""
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job["sub"] != sub:
+                return None
+            return _public_job_view(job)
+
+    async def list_active(self, sub: str) -> list[dict]:
+        """All jobs for this sub that are pending/running, plus completed/
+        failed ones updated within the last 60s (so iOS catches the
+        completion on its next poll even if the job finished between polls)."""
+        recent_cutoff = time.time() - 60
+        async with self._lock:
+            return [
+                _public_job_view(j)
+                for j in self._jobs.values()
+                if j["sub"] == sub
+                and (j["status"] in ("pending", "running") or j["updated_at"] > recent_cutoff)
+            ]
+
+    async def cancel(self, job_id: str, sub: str) -> bool:
+        """Cancel a running job. Returns True if cancelled, False if not
+        found / not yours / already completed."""
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job["sub"] != sub:
+                return False
+            if job["status"] not in ("pending", "running"):
+                return False
+            job["status"] = "cancelled"
+            job["updated_at"] = time.time()
+
+        worker = self._workers.pop(job_id, None)
+        if worker is not None and not worker.done():
+            worker.cancel()
+        return True
+
+    def register_worker(self, job_id: str, task: asyncio.Task) -> None:
+        self._workers[job_id] = task
+
+    def unregister_worker(self, job_id: str) -> None:
+        self._workers.pop(job_id, None)
+
+    async def cleanup_old(self) -> int:
+        """Drop jobs older than the TTL. Called periodically by the
+        background sweeper task. Returns count removed."""
+        now = time.time()
+        removed = 0
+        async with self._lock:
+            to_remove: list[str] = []
+            for jid, job in self._jobs.items():
+                if job["status"] in ("completed", "failed", "cancelled"):
+                    if now - job["updated_at"] > JOB_TTL_SECONDS:
+                        to_remove.append(jid)
+                elif now - job["created_at"] > JOB_MAX_AGE_SECONDS:
+                    to_remove.append(jid)
+            for jid in to_remove:
+                self._jobs.pop(jid, None)
+                removed += 1
+        return removed
+
+
+def _public_job_view(job: dict) -> dict:
+    """Strip the request_body from external responses — it's only stored for
+    debugging and could be sizable. Clients already have the body locally."""
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "response": job["response"],
+        "error": job["error"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    }
+
+
+job_store = JobStore()
+
+
+async def _periodic_job_cleanup():
+    """Background task — sweeps stale jobs every 5 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            removed = await job_store.cleanup_old()
+            if removed:
+                log.info("job_cleanup: removed %d stale job(s)", removed)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("job_cleanup error: %s", e)
+
+
+@app.on_event("startup")
+async def _startup_jobs():
+    asyncio.create_task(_periodic_job_cleanup())
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ─── Research Job API ─────────────────────────────────────────────────────────
+#
+# iOS POSTs /research to start a long-running research call, gets back a
+# job_id immediately. The actual upstream provider call (gpt-5.4 +
+# web_search_preview, typically 30-180s) runs in a background asyncio task.
+# iOS polls /research/{id} every few seconds — each poll is tiny and fast,
+# which works perfectly with iOS background URLSession (the long-held-
+# connection pattern doesn't, hence this redesign). Cancellation via DELETE
+# stops the upstream call and stops the bill (best-effort).
+
+@app.post("/research")
+@limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
+async def start_research(request: Request):
+    check_auth(request)
+    sub = request.state.sub
+
+    if AI_PROVIDER != "openai":
+        raise HTTPException(
+            status_code=400,
+            detail=f"/research requires AI_PROVIDER=openai (current: {AI_PROVIDER})"
+        )
+
+    body = await request.json()
+    job_id = str(uuid.uuid4())
+    await job_store.create(job_id, sub, body)
+
+    task = asyncio.create_task(_run_research_job(job_id, body))
+    job_store.register_worker(job_id, task)
+
+    log.info("research_start sub=%s job=%s", sub, job_id)
+    return JSONResponse({"job_id": job_id, "status": "pending"})
+
+
+@app.get("/research/{job_id}")
+@limiter.limit("120/minute", key_func=_jwt_sub_or_ip)
+async def get_research(request: Request, job_id: str):
+    """Poll for status. Tiny response when running (just status), full
+    response payload when completed. Higher rate limit because polling
+    is the expected access pattern."""
+    check_auth(request)
+    sub = request.state.sub
+
+    job = await job_store.get(job_id, sub)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return JSONResponse(job)
+
+
+@app.get("/research")
+@limiter.limit("60/minute", key_func=_jwt_sub_or_ip)
+async def list_research(request: Request):
+    """Return all active jobs for the user (pending/running) plus any
+    that completed within the last minute. Lets iOS poll N jobs in a
+    single request instead of N separate requests."""
+    check_auth(request)
+    sub = request.state.sub
+    jobs = await job_store.list_active(sub)
+    return JSONResponse({"jobs": jobs})
+
+
+@app.delete("/research/{job_id}")
+@limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
+async def cancel_research(request: Request, job_id: str):
+    check_auth(request)
+    sub = request.state.sub
+    cancelled = await job_store.cancel(job_id, sub)
+    if not cancelled:
+        # 404 covers both "doesn't exist" and "already completed"; iOS
+        # treats both the same way (no further polling needed).
+        raise HTTPException(status_code=404, detail="Job not found or already completed")
+    log.info("research_cancel sub=%s job=%s", sub, job_id)
+    return JSONResponse({"id": job_id, "status": "cancelled"})
+
+
+async def _run_research_job(job_id: str, body: dict):
+    """The actual long-running work — POSTs to OpenAI's Responses API and
+    stores the result. Runs as a background asyncio task. Cancellation
+    propagates from job_store.cancel() via task.cancel()."""
+    try:
+        await job_store.update(job_id, status="running")
+
+        headers = {
+            "Authorization": f"Bearer {AI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        # Force non-streaming — we want the complete response in one shot
+        # so we can store it. iOS gets the result via polling, not stream.
+        body.pop("stream", None)
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(OPENAI_RESPONSES_URL, headers=headers, json=body)
+
+        if r.status_code != 200:
+            err_body = r.text[:500]
+            log.error("research_job_upstream_error job=%s status=%s body=%s", job_id, r.status_code, err_body)
+            await job_store.update(
+                job_id,
+                status="failed",
+                error=f"Upstream error: HTTP {r.status_code}",
+            )
+            return
+
+        result = r.json()
+        await job_store.update(job_id, status="completed", response=result)
+        log.info("research_job_complete job=%s", job_id)
+
+    except asyncio.CancelledError:
+        await job_store.update(job_id, status="cancelled", error="Cancelled by client")
+        log.info("research_job_cancelled job=%s", job_id)
+        raise
+    except Exception as e:
+        log.exception("research_job_error job=%s", job_id)
+        await job_store.update(job_id, status="failed", error=str(e)[:200])
+    finally:
+        job_store.unregister_worker(job_id)
 
 
 @app.post("/v1/chat/completions")
