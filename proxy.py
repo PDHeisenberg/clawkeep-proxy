@@ -549,7 +549,7 @@ async def start_research(request: Request):
 
 
 @app.post("/research/passthrough")
-@limiter.limit("30/minute", key_func=lambda r: f"ip:{get_remote_address(r)}")
+@limiter.limit("30/minute", key_func=get_remote_address)
 async def start_research_passthrough(request: Request):
     """Direct-API-mode research. Caller supplies their OWN provider URL +
     auth headers; proxy uses those for the upstream call instead of our
@@ -639,7 +639,7 @@ def _detect_provider(url: str) -> str:
 
 
 @app.get("/research/{job_id}")
-@limiter.limit("120/minute", key_func=lambda r: f"ip:{get_remote_address(r)}")
+@limiter.limit("120/minute", key_func=get_remote_address)
 async def get_research(request: Request, job_id: str):
     """Poll for status. Tiny response when running, full response payload
     when completed.
@@ -673,7 +673,7 @@ async def list_research(request: Request):
 
 
 @app.delete("/research/{job_id}")
-@limiter.limit("30/minute", key_func=lambda r: f"ip:{get_remote_address(r)}")
+@limiter.limit("30/minute", key_func=get_remote_address)
 async def cancel_research(request: Request, job_id: str):
     """Cancel a job. Same UUID-as-capability auth model as GET — no
     JWT required, the UUID is the access control. The biggest harm a
