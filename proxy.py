@@ -58,13 +58,6 @@ JWT_SECRET          = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM       = "HS256"
 JWT_EXPIRY_DAYS     = 30
 
-# Shared TestFlight bearer — beta testers don't have purchased subscriptions,
-# so they can't mint a per-user JWT via /validate-receipt. The app falls back
-# to this token when isTestFlight && JWT empty. Leave unset to disable the
-# bypass entirely (production hardening). Rate-limited per-IP, not per-sub,
-# since every TestFlight tester sends the same sub identifier.
-TESTFLIGHT_BEARER   = os.environ.get("TESTFLIGHT_BEARER", "")
-
 if not JWT_SECRET:
     raise RuntimeError(
         "JWT_SECRET environment variable is required. "
@@ -143,14 +136,10 @@ app = FastAPI(title="ClawKeep Pro Proxy", version="1.0.0")
 # ─── Rate limiting ────────────────────────────────────────────────────────────
 
 def _jwt_sub_or_ip(request: Request) -> str:
-    """Rate-limit key: JWT `sub` when the token is valid, else client IP.
-    TestFlight shared-token requests always rate-limit by IP since every tester
-    sends the same token (no per-user identity)."""
+    """Rate-limit key: JWT `sub` when the token is valid, else client IP."""
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if token:
-        if TESTFLIGHT_BEARER and token == TESTFLIGHT_BEARER:
-            return f"ip:{get_remote_address(request)}"
         try:
             payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
             sub = payload.get("sub")
@@ -183,21 +172,11 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def check_auth(request: Request):
-    """Require a valid per-user JWT signed with JWT_SECRET.
-
-    Also accepts the shared TESTFLIGHT_BEARER token (when configured) so beta
-    testers without a purchased subscription can still use Pro features.
-    The TestFlight path doesn't carry per-user identity — it's identified in
-    logs and rate-limit keys as `testflight-shared`.
-    """
+    """Require a valid per-user JWT signed with JWT_SECRET."""
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if TESTFLIGHT_BEARER and token == TESTFLIGHT_BEARER:
-        request.state.sub = "testflight-shared"
-        return
 
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -576,21 +555,17 @@ async def start_research_passthrough(request: Request):
     Anthropic/Gemini/custom get reliability via the polling shape but
     no live progress events (different streaming formats; deferred)."""
     # Try to identify the caller for nicer log lines, but don't reject
-    # them if they're anonymous. Pro JWTs and TestFlight bearers still
-    # show up in logs as their proper sub identifier; everyone else is
-    # logged as "anonymous-{ip-prefix}" so we can grep.
+    # them if they're anonymous. Pro JWTs show up in logs as their proper
+    # sub identifier; everyone else stays anonymous.
     sub = "anonymous"
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if token:
-        if TESTFLIGHT_BEARER and token == TESTFLIGHT_BEARER:
-            sub = "testflight-shared"
-        else:
-            try:
-                payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-                sub = payload.get("sub", "anonymous")
-            except jwt.PyJWTError:
-                pass  # Stays "anonymous" — invalid token is fine here
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            sub = payload.get("sub", "anonymous")
+        except jwt.PyJWTError:
+            pass  # Stays "anonymous" — invalid token is fine here
     request.state.sub = sub
 
     body = await request.json()
