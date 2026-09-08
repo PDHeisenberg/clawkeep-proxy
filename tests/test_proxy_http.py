@@ -52,3 +52,43 @@ class HTTPTests(unittest.TestCase):
 
     def test_unsigned_store_notification_rejected(self):
         self.assertEqual(self.client.post("/app-store/notifications", json={"signedPayload": "invalid"}).status_code, 400)
+
+    def test_job_results_and_cancellation_require_the_owner(self):
+        import uuid
+        job_id = str(uuid.uuid4())
+        self.client.portal.call(proxy.job_store.create, job_id, "alice", {})
+        for method in (self.client.get, self.client.delete):
+            self.assertEqual(method("/research/" + job_id).status_code, 401)
+            self.assertEqual(method("/research/" + job_id, headers=self.auth("bob")).status_code, 404)
+        self.assertEqual(self.client.get("/research/" + job_id, headers=self.auth()).status_code, 200)
+        self.assertEqual(self.client.delete("/research/" + job_id, headers=self.auth()).status_code, 200)
+
+    def test_passthrough_job_id_and_pro_token_do_not_replace_private_capability(self):
+        import uuid
+        from functools import partial
+        job_id = str(uuid.uuid4())
+        self.client.portal.call(partial(proxy.job_store.create, job_id, "byok:installation", {}, mode="passthrough"))
+        for headers in ({}, self.auth(), {"X-Research-Token": "wrong"}):
+            self.assertEqual(self.client.get("/research/" + job_id, headers=headers).status_code, 404)
+        headers = {"X-Research-Token": proxy.job_capability(job_id)}
+        self.assertEqual(self.client.get("/research/" + job_id, headers=headers).status_code, 200)
+        self.assertEqual(self.client.delete("/research/" + job_id, headers=headers).status_code, 200)
+
+    def test_replayed_start_returns_same_job_without_second_worker(self):
+        from unittest.mock import AsyncMock
+        import uuid
+        headers = {**self.auth("idempotency"), "Idempotency-Key": str(uuid.uuid4())}
+        with patch.object(proxy, "_run_research_job_generic", new_callable=AsyncMock) as worker:
+            first = self.client.post("/research", json={"input": "Question"}, headers=headers)
+            second = self.client.post("/research", json={"input": "Question"}, headers=headers)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(first.json()["job_id"], second.json()["job_id"])
+            self.assertEqual(worker.call_count, 1)
+            changed = self.client.post("/research", json={"input": "Changed question"}, headers=headers)
+            self.assertEqual(changed.status_code, 409)
+
+    def test_refunded_transaction_rejects_an_otherwise_unexpired_token(self):
+        proxy.job_store.set_revoked("txn-refunded", time.time() + 600)
+        response = self.client.post("/research", json={}, headers=self.auth("refunded"))
+        self.assertEqual(response.status_code, 401)
