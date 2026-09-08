@@ -21,6 +21,12 @@ import json
 import uuid
 import asyncio
 import logging
+import hashlib
+import hmac
+import socket
+from urllib.parse import urlsplit
+from security import subscription_deadline, token_deadline, validate_upstream, validate_resolved_addresses, sanitize_upstream_headers
+from job_store import JobStore, JobConflict, JobCapacityError
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
@@ -56,7 +62,6 @@ PORT           = int(os.environ.get("PORT", "8080"))
 # longer talks to Apple's deprecated verifyReceipt endpoint.
 JWT_SECRET          = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM       = "HS256"
-JWT_EXPIRY_DAYS     = 30
 
 if not JWT_SECRET:
     raise RuntimeError(
@@ -89,34 +94,18 @@ except FileNotFoundError:
         "Run: curl -sSLo AppleRootCA-G3.cer https://www.apple.com/certificateauthority/AppleRootCA-G3.cer"
     )
 
-# One verifier per environment. Each attempt is tried in order until one
-# accepts the JWS, so a single endpoint works for TestFlight (Sandbox) and
-# App Store (Production) without the caller having to know which it is.
-# The Production verifier requires the numeric App Apple ID (assigned by
-# App Store Connect once the app is listed). Until that ID is configured,
-# only Sandbox is wired up — which covers TestFlight + sandbox purchases.
-_VERIFIERS: list[tuple[Environment, SignedDataVerifier]] = []
-if APP_APPLE_ID_INT is not None:
-    _VERIFIERS.append((
-        Environment.PRODUCTION,
-        SignedDataVerifier(
-            root_certificates=_APPLE_ROOT_CERTS,
-            enable_online_checks=False,
-            environment=Environment.PRODUCTION,
-            bundle_id=EXPECTED_BUNDLE_ID,
-            app_apple_id=APP_APPLE_ID_INT,
-        ),
-    ))
-_VERIFIERS.append((
-    Environment.SANDBOX,
-    SignedDataVerifier(
-        root_certificates=_APPLE_ROOT_CERTS,
-        enable_online_checks=False,
-        environment=Environment.SANDBOX,
-        bundle_id=EXPECTED_BUNDLE_ID,
-        app_apple_id=None,
-    ),
-))
+# Production and TestFlight credentials are deliberately separate.
+APPLE_ENVIRONMENT = os.environ.get("APPLE_ENVIRONMENT", "production").lower()
+if APPLE_ENVIRONMENT not in ("production", "sandbox"):
+    raise RuntimeError("APPLE_ENVIRONMENT must be production or sandbox")
+if APPLE_ENVIRONMENT == "production" and APP_APPLE_ID_INT is None:
+    raise RuntimeError("APP_APPLE_ID is required for production subscription verification")
+_verification_environment = Environment.PRODUCTION if APPLE_ENVIRONMENT == "production" else Environment.SANDBOX
+_VERIFIERS = [(_verification_environment, SignedDataVerifier(
+    root_certificates=_APPLE_ROOT_CERTS, enable_online_checks=False,
+    environment=_verification_environment, bundle_id=EXPECTED_BUNDLE_ID,
+    app_apple_id=APP_APPLE_ID_INT if APPLE_ENVIRONMENT == "production" else None,
+))]
 
 # Provider upstream URLs
 PROVIDER_URLS = {
@@ -172,20 +161,17 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def check_auth(request: Request):
-    """Require a valid per-user JWT signed with JWT_SECRET."""
     auth = request.headers.get("Authorization", "")
-    token = auth.removeprefix("Bearer ").strip()
-    if not token:
+    if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Unauthorized: token expired")
+        payload = jwt.decode(auth[7:].strip(), JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                             options={"require": ["exp", "sub", "jti"]})
+        if not payload["sub"] or job_store.is_revoked(payload["jti"]):
+            raise HTTPException(status_code=401, detail="Subscription access revoked")
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    request.state.sub = payload.get("sub", "-")
+        raise HTTPException(status_code=401, detail="Session expired. Refresh your subscription access.")
+    request.state.sub = payload["sub"]
 
 
 # ─── Apple StoreKit 2 JWS verification + JWT minting ─────────────────────────
@@ -218,39 +204,21 @@ def _verify_transaction_jws(jws: str):
 
 
 def _check_active_subscription(payload) -> None:
-    """Enforce that the verified transaction is for one of our products and
-    hasn't expired past the grace window."""
-    product_id = getattr(payload, "productId", "") or ""
-    if product_id not in VALID_PRODUCT_IDS:
-        log.error("validate-receipt: unknown productId=%s", product_id)
-        raise HTTPException(status_code=402, detail="Unsupported product")
-
-    expires_ms = getattr(payload, "expiresDate", 0) or 0
-    now_ms = int(time.time() * 1000)
-    grace_ms = 7 * 24 * 60 * 60 * 1000
-    if expires_ms and (expires_ms + grace_ms) < now_ms:
-        log.error(
-            "validate-receipt: expired expires_ms=%s now_ms=%s productId=%s",
-            expires_ms, now_ms, product_id,
-        )
-        raise HTTPException(status_code=402, detail="Subscription expired")
+    try:
+        subscription_deadline(payload, int(time.time()))
+    except ValueError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+    transaction_id = str(getattr(payload, "transactionId", "") or "")
+    if not transaction_id or job_store.is_revoked(transaction_id):
+        raise HTTPException(status_code=402, detail="Subscription transaction is missing or revoked")
 
 
-def _mint_jwt(transaction_id: str, product_id: str, sub_expires_ms: int) -> tuple[str, int]:
+def _mint_jwt(transaction_id: str, product_id: str, sub_expires_ms: int, signed_transaction_id: str) -> tuple[str, int]:
     now = int(time.time())
-    sub_expires_sec = int(sub_expires_ms / 1000)
-    default_exp = now + JWT_EXPIRY_DAYS * 24 * 60 * 60
-    exp = min(sub_expires_sec, default_exp) if sub_expires_sec > now else default_exp
-
-    tier = "yearly" if "yearly" in product_id else "monthly"
-    payload = {
-        "sub": transaction_id,
-        "tier": tier,
-        "exp": exp,
-        "iat": now,
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return token, exp
+    exp = token_deadline(sub_expires_ms, now)
+    payload = {"sub": transaction_id, "jti": signed_transaction_id,
+               "tier": "yearly" if "yearly" in product_id else "monthly", "exp": exp, "iat": now}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), exp
 
 
 @app.post("/validate-receipt")
@@ -262,7 +230,7 @@ async def validate_receipt(request: Request):
     transaction payload signed by Apple with a cert chain rooted at
     AppleRootCA-G3. We verify the signature offline and mint our JWT.
     """
-    body = await request.json()
+    body = await read_json_object(request)
     jws = body.get("transaction_jws")
     if not jws or not isinstance(jws, str):
         raise HTTPException(status_code=400, detail="Missing transaction_jws")
@@ -280,7 +248,7 @@ async def validate_receipt(request: Request):
     if not transaction_id:
         raise HTTPException(status_code=400, detail="Missing transaction id in signed payload")
 
-    token, exp = _mint_jwt(transaction_id, product_id, expires_ms)
+    token, exp = _mint_jwt(transaction_id, product_id, expires_ms, str(payload.transactionId))
     tier = "yearly" if "yearly" in product_id else "monthly"
     expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -290,170 +258,9 @@ async def validate_receipt(request: Request):
         "tier": tier,
     })
 
-# ─── Job Store (in-memory, ephemeral) ────────────────────────────────────────
-#
-# Backs the polling-based research API. Jobs live for the lifetime of the
-# container — Railway redeploys lose in-flight research, which is acceptable:
-# a research job runs for 1-3 minutes, redeploys are minutes apart, and a
-# lost job surfaces as "failed" on the iOS side and the user retries.
-# Persistence (SQLite + Railway Volume) is a future upgrade if we see this
-# matter in practice. Cleaned up after 1 hour to keep memory bounded.
-
-JOB_TTL_SECONDS = 3600         # Drop completed/failed jobs after 1 hour
-JOB_MAX_AGE_SECONDS = 7200     # Hard TTL even for stuck jobs
-
-class JobStore:
-    """Thread-safe in-memory store for research jobs. All methods async-safe."""
-
-    def __init__(self):
-        self._jobs: dict[str, dict] = {}
-        self._workers: dict[str, asyncio.Task] = {}
-        self._lock = asyncio.Lock()
-
-    async def create(self, job_id: str, sub: str, request_body: dict) -> None:
-        now = time.time()
-        async with self._lock:
-            self._jobs[job_id] = {
-                "id": job_id,
-                "sub": sub,
-                "status": "pending",
-                "request_body": request_body,
-                "response": None,
-                "error": None,
-                "progress": None,    # {phase, current_query, searches_done, searches_total}
-                "created_at": now,
-                "updated_at": now,
-            }
-
-    async def update(
-        self,
-        job_id: str,
-        status: str | None = None,
-        response: dict | None = None,
-        error: str | None = None,
-        progress: dict | None = None,
-    ) -> None:
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return
-            if status is not None:
-                job["status"] = status
-            if response is not None:
-                job["response"] = response
-            if error is not None:
-                job["error"] = error
-            if progress is not None:
-                job["progress"] = progress
-            job["updated_at"] = time.time()
-
-    async def get(self, job_id: str, sub: str) -> dict | None:
-        """Fetch a job, scoped to the requesting sub. Returns None for
-        unknown jobs OR jobs belonging to a different sub (404, not 403,
-        on purpose — don't leak existence)."""
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or job["sub"] != sub:
-                return None
-            return _public_job_view(job)
-
-    async def get_by_id_only(self, job_id: str) -> dict | None:
-        """Fetch a job by UUID alone — no sub check. Used by the public
-        polling endpoint where the UUID acts as a capability token. The
-        UUID is unguessable (122 bits of randomness); its possession is
-        sufficient proof that the requester is the original creator (or
-        someone the creator legitimately shared it with)."""
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            return _public_job_view(job) if job is not None else None
-
-    async def cancel_by_id_only(self, job_id: str) -> bool:
-        """Cancel by UUID alone — same capability-token model as
-        get_by_id_only. Returns True if cancelled, False if not found
-        or already terminal."""
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or job["status"] not in ("pending", "running"):
-                return False
-            job["status"] = "cancelled"
-            job["updated_at"] = time.time()
-
-        worker = self._workers.pop(job_id, None)
-        if worker is not None and not worker.done():
-            worker.cancel()
-        return True
-
-    async def list_active(self, sub: str) -> list[dict]:
-        """All jobs for this sub that are pending/running, plus completed/
-        failed ones updated within the last 60s (so iOS catches the
-        completion on its next poll even if the job finished between polls)."""
-        recent_cutoff = time.time() - 60
-        async with self._lock:
-            return [
-                _public_job_view(j)
-                for j in self._jobs.values()
-                if j["sub"] == sub
-                and (j["status"] in ("pending", "running") or j["updated_at"] > recent_cutoff)
-            ]
-
-    async def cancel(self, job_id: str, sub: str) -> bool:
-        """Cancel a running job. Returns True if cancelled, False if not
-        found / not yours / already completed."""
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or job["sub"] != sub:
-                return False
-            if job["status"] not in ("pending", "running"):
-                return False
-            job["status"] = "cancelled"
-            job["updated_at"] = time.time()
-
-        worker = self._workers.pop(job_id, None)
-        if worker is not None and not worker.done():
-            worker.cancel()
-        return True
-
-    def register_worker(self, job_id: str, task: asyncio.Task) -> None:
-        self._workers[job_id] = task
-
-    def unregister_worker(self, job_id: str) -> None:
-        self._workers.pop(job_id, None)
-
-    async def cleanup_old(self) -> int:
-        """Drop jobs older than the TTL. Called periodically by the
-        background sweeper task. Returns count removed."""
-        now = time.time()
-        removed = 0
-        async with self._lock:
-            to_remove: list[str] = []
-            for jid, job in self._jobs.items():
-                if job["status"] in ("completed", "failed", "cancelled"):
-                    if now - job["updated_at"] > JOB_TTL_SECONDS:
-                        to_remove.append(jid)
-                elif now - job["created_at"] > JOB_MAX_AGE_SECONDS:
-                    to_remove.append(jid)
-            for jid in to_remove:
-                self._jobs.pop(jid, None)
-                removed += 1
-        return removed
-
-
-def _public_job_view(job: dict) -> dict:
-    """Strip the request_body from external responses — it's only stored for
-    debugging and could be sizable. Clients already have the body locally."""
-    return {
-        "id": job["id"],
-        "status": job["status"],
-        "response": job["response"],
-        "error": job["error"],
-        "progress": job.get("progress"),
-        "created_at": job["created_at"],
-        "updated_at": job["updated_at"],
-    }
-
-
-job_store = JobStore()
-
+# Mount data/ on a persistent volume in production. One serving process owns
+# in-flight network workers; durable metadata also survives process restarts.
+job_store = JobStore(os.environ.get("JOB_DATABASE_PATH", "data/jobs.sqlite3"))
 
 async def _periodic_job_cleanup():
     """Background task — sweeps stale jobs every 5 minutes."""
@@ -471,7 +278,8 @@ async def _periodic_job_cleanup():
 
 @app.on_event("startup")
 async def _startup_jobs():
-    asyncio.create_task(_periodic_job_cleanup())
+    await job_store.recover_interrupted()
+    app.state.job_cleanup_task = asyncio.create_task(_periodic_job_cleanup())
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -494,121 +302,58 @@ async def health():
 @app.post("/research")
 @limiter.limit("30/minute", key_func=_jwt_sub_or_ip)
 async def start_research(request: Request):
-    """Pro-mode research. Proxy uses its own AI_API_KEY for the upstream call.
-    Internally just a thin wrapper around the generic worker, hardcoded to
-    OpenAI Responses API."""
     check_auth(request)
-    sub = request.state.sub
-
     if AI_PROVIDER != "openai":
-        raise HTTPException(
-            status_code=400,
-            detail=f"/research requires AI_PROVIDER=openai (current: {AI_PROVIDER})"
-        )
-
-    body = await request.json()
-    job_id = str(uuid.uuid4())
-    await job_store.create(job_id, sub, body)
-
-    upstream_headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    task = asyncio.create_task(_run_research_job_generic(
-        job_id=job_id,
-        body=body,
-        upstream_url=OPENAI_RESPONSES_URL,
-        upstream_headers=upstream_headers,
-        provider="openai",
-    ))
-    job_store.register_worker(job_id, task)
-
-    log.info("research_start sub=%s job=%s provider=openai", sub, job_id)
-    return JSONResponse({"job_id": job_id, "status": "pending"})
+        raise HTTPException(status_code=400, detail="Research is not configured for this provider")
+    body = validate_pro_body(await read_json_object(request), responses_api=True)
+    job_id, created = await admit_job(request, body, mode="pro")
+    if created:
+        task = asyncio.create_task(_run_research_job_generic(
+            job_id=job_id, body=body, upstream_url=OPENAI_RESPONSES_URL,
+            upstream_headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+            provider="openai"))
+        job_store.register_worker(job_id, task)
+    return await start_response(job_id)
 
 
 @app.post("/research/passthrough")
 @limiter.limit("30/minute", key_func=get_remote_address)
 async def start_research_passthrough(request: Request):
-    """Direct-API-mode research. Caller supplies their OWN provider URL +
-    auth headers; proxy uses those for the upstream call instead of our
-    AI_API_KEY. The user's key passes through proxy memory only — never
-    written to disk, never logged, scrubbed when the worker exits.
-
-    NO AUTH REQUIRED. This is safe by construction: the endpoint takes
-    `upstream_url` and `upstream_headers` from the request body and uses
-    THOSE for the upstream call. It never reads `AI_API_KEY`, so it
-    cannot be exploited to grant Pro access — the path that uses our
-    key is in the separate `/research` handler which still requires JWT.
-    Anyone hitting this endpoint pays their own provider for their own
-    tokens; our cost is just compute for relaying. Per-IP rate limit
-    bounds compute exposure.
-
-    Body shape:
-      {
-        "upstream_url": "https://api.openai.com/v1/responses",
-        "upstream_headers": {"Authorization": "Bearer sk-...", "Content-Type": "application/json"},
-        "request_body": { ...the original provider request body... }
-      }
-
-    Provider auto-detected from URL — OpenAI gets streaming + progress,
-    Anthropic/Gemini/custom get reliability via the polling shape but
-    no live progress events (different streaming formats; deferred)."""
-    # Try to identify the caller for nicer log lines, but don't reject
-    # them if they're anonymous. Pro JWTs show up in logs as their proper
-    # sub identifier; everyone else stays anonymous.
-    sub = "anonymous"
-    auth = request.headers.get("Authorization", "")
-    token = auth.removeprefix("Bearer ").strip()
-    if token:
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            sub = payload.get("sub", "anonymous")
-        except jwt.PyJWTError:
-            pass  # Stays "anonymous" — invalid token is fine here
-    request.state.sub = sub
-
-    body = await request.json()
-    upstream_url = body.get("upstream_url")
-    upstream_headers = body.get("upstream_headers") or {}
-    request_body = body.get("request_body")
-
-    if not upstream_url or not isinstance(upstream_url, str):
-        raise HTTPException(status_code=400, detail="Missing upstream_url")
-    if request_body is None:
-        raise HTTPException(status_code=400, detail="Missing request_body")
-    if not isinstance(upstream_headers, dict):
-        raise HTTPException(status_code=400, detail="upstream_headers must be a dict")
-
-    provider = _detect_provider(upstream_url)
-    job_id = str(uuid.uuid4())
-    # We persist request_body for diagnostics (it's the prompt payload — not
-    # secret). upstream_headers stays out of JobStore entirely; it lives only
-    # in the worker task's local scope and is GC'd when the task exits.
-    await job_store.create(job_id, sub, request_body)
-
-    task = asyncio.create_task(_run_research_job_generic(
-        job_id=job_id,
-        body=request_body,
-        upstream_url=upstream_url,
-        upstream_headers=upstream_headers,
-        provider=provider,
-    ))
-    job_store.register_worker(job_id, task)
-
-    log.info("research_passthrough_start sub=%s job=%s provider=%s", sub, job_id, provider)
-    return JSONResponse({"job_id": job_id, "status": "pending"})
+    envelope = await read_json_object(request)
+    upstream_url = envelope.get("upstream_url")
+    body = envelope.get("request_body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request_body must be an object")
+    try:
+        host = validate_upstream(upstream_url, os.environ.get("CUSTOM_UPSTREAM_HOSTS", "").split(","))
+        addresses = await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        validate_resolved_addresses({entry[4][0] for entry in addresses})
+        headers = sanitize_upstream_headers(envelope.get("upstream_headers") or {})
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Provider destination is unavailable or not permitted") from exc
+    # No provider credentials or full request bodies are stored in JobStore.
+    # Idempotency is scoped to a client-generated installation ID, hashed here.
+    client_id = request.headers.get("X-ClawKeep-Client-ID", "")
+    if not client_id or len(client_id) > 128:
+        raise HTTPException(status_code=400, detail="Update ClawKeep to use hosted research")
+    request.state.sub = "byok:" + hashlib.sha256(client_id.encode()).hexdigest()
+    job_id, created = await admit_job(request, {"url": upstream_url, "body": body}, mode="passthrough")
+    if created:
+        task = asyncio.create_task(_run_research_job_generic(
+            job_id=job_id, body=body, upstream_url=upstream_url,
+            upstream_headers=headers, provider=_detect_provider(upstream_url)))
+        job_store.register_worker(job_id, task)
+    return await start_response(job_id, include_capability=True)
 
 
 def _detect_provider(url: str) -> str:
-    """Identify provider from upstream URL so the worker picks the right
-    request handling strategy (streaming for OpenAI, plain POST otherwise)."""
-    lower = url.lower()
-    if "openai.com" in lower or "/v1/responses" in lower or "/v1/chat/completions" in lower:
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host == "api.openai.com":
         return "openai"
-    if "anthropic.com" in lower:
+    if host == "api.anthropic.com":
         return "anthropic"
-    if "googleapis.com" in lower or "generativelanguage" in lower:
+    if host == "generativelanguage.googleapis.com":
         return "gemini"
     return "custom"
 
@@ -616,22 +361,10 @@ def _detect_provider(url: str) -> str:
 @app.get("/research/{job_id}")
 @limiter.limit("120/minute", key_func=get_remote_address)
 async def get_research(request: Request, job_id: str):
-    """Poll for status. Tiny response when running, full response payload
-    when completed.
-
-    NO AUTH. The job_id is a UUID v4 — 122 bits of randomness, effectively
-    unguessable. Anyone with the UUID can read the job; you only get the
-    UUID by being the caller who started the job (it's in the response to
-    POST /research[/passthrough]). This sidesteps the question of "who
-    can poll a passthrough job created with no auth" — the answer is
-    "whoever has the UUID", and the UUID acts as a one-shot capability
-    token. If a UUID leaks (logs, etc.), worst case someone reads someone
-    else's research result, which is not a meaningful privacy leak — these
-    are saved-link summaries, not user secrets."""
+    await authorize_job(request, job_id)
     job = await job_store.get_by_id_only(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-
     return JSONResponse(job)
 
 
@@ -650,16 +383,9 @@ async def list_research(request: Request):
 @app.delete("/research/{job_id}")
 @limiter.limit("30/minute", key_func=get_remote_address)
 async def cancel_research(request: Request, job_id: str):
-    """Cancel a job. Same UUID-as-capability auth model as GET — no
-    JWT required, the UUID is the access control. The biggest harm a
-    leaked UUID could do is cancelling someone else's research; cheap
-    annoyance, not a security incident."""
-    cancelled = await job_store.cancel_by_id_only(job_id)
-    if not cancelled:
-        # 404 covers both "doesn't exist" and "already completed"; iOS
-        # treats both the same way (no further polling needed).
-        raise HTTPException(status_code=404, detail="Job not found or already completed")
-    log.info("research_cancel job=%s", job_id)
+    await authorize_job(request, job_id)
+    await job_store.cancel_by_id_only(job_id)
+    # Idempotent cancellation also succeeds for already-finished work.
     return JSONResponse({"id": job_id, "status": "cancelled"})
 
 
@@ -689,7 +415,7 @@ async def _run_research_job_generic(
             progress={"phase": "starting"},
         )
 
-        if provider == "openai":
+        if provider == "openai" and urlsplit(upstream_url).path.endswith("/responses"):
             await _run_openai_streaming(job_id, body, upstream_url, upstream_headers)
         else:
             await _run_simple_call(job_id, body, upstream_url, upstream_headers, provider)
@@ -699,8 +425,8 @@ async def _run_research_job_generic(
         log.info("research_job_cancelled job=%s", job_id)
         raise
     except Exception as e:
-        log.exception("research_job_error job=%s provider=%s", job_id, provider)
-        await job_store.update(job_id, status="failed", error=str(e)[:200])
+        log.error("research_job_error job=%s provider=%s type=%s", job_id, provider, type(e).__name__)
+        await job_store.update(job_id, status="failed", error="The provider connection failed. Please retry.")
     finally:
         job_store.unregister_worker(job_id)
 
@@ -737,7 +463,7 @@ async def _run_openai_streaming(job_id: str, body: dict, url: str, headers: dict
     current_query: str | None = None
     text_started = False
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=300) as client:
         async with client.stream("POST", url, headers=headers, json=body) as r:
             if r.status_code != 200:
                 err_body = (await r.aread()).decode("utf-8", errors="replace")[:500]
@@ -886,7 +612,7 @@ async def _run_simple_call(job_id: str, body: dict, url: str, headers: dict, pro
     # Strip stream:true if the caller set it — we want the full response in one shot.
     body.pop("stream", None)
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=300) as client:
         r = await client.post(url, headers=headers, json=body)
 
     if r.status_code != 200:
@@ -919,7 +645,7 @@ async def _run_simple_call(job_id: str, body: dict, url: str, headers: dict, pro
 async def chat_completions(request: Request):
     check_auth(request)
 
-    body = await request.json()
+    body = validate_pro_body(await read_json_object(request), responses_api=request.url.path.endswith("/responses"))
     stream = body.get("stream", False)
     model = body.get("model", DEFAULT_MODEL)
 
@@ -944,7 +670,7 @@ async def responses(request: Request):
             detail=f"/v1/responses requires AI_PROVIDER=openai (current: {AI_PROVIDER})"
         )
 
-    body = await request.json()
+    body = validate_pro_body(await read_json_object(request), responses_api=request.url.path.endswith("/responses"))
     stream = body.get("stream", False)
 
     headers = {
@@ -956,7 +682,7 @@ async def responses(request: Request):
         return await _stream_response(OPENAI_RESPONSES_URL, headers, body, "openai", request)
 
     # Responses API calls can be long (web searches take time)
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=180) as client:
         r = await client.post(OPENAI_RESPONSES_URL, headers=headers, json=body)
         if r.status_code != 200:
             _log_upstream_error(request, "responses", r.status_code, r.text)
@@ -968,7 +694,7 @@ async def responses(request: Request):
 
 def _log_upstream_error(request: Request, provider: str, status: int, text: str):
     sub = getattr(request.state, "sub", "-") if request is not None else "-"
-    log.error("upstream_error provider=%s status=%s sub=%s body=%s", provider, status, sub, text[:500])
+    log.error("upstream_error provider=%s status=%s sub=%s", provider, status, sub)
 
 
 # ─── Anthropic forwarding ─────────────────────────────────────────────────────
@@ -997,7 +723,7 @@ async def _forward_anthropic(body: dict, model: str, stream: bool, request: Requ
     if stream:
         return await _stream_response(PROVIDER_URLS["anthropic"], headers, anthropic_body, "anthropic", request)
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=90) as client:
         r = await client.post(PROVIDER_URLS["anthropic"], headers=headers, json=anthropic_body)
         if r.status_code != 200:
             _log_upstream_error(request, "anthropic", r.status_code, r.text)
@@ -1031,7 +757,7 @@ async def _forward_openai_compat(body: dict, model: str, stream: bool, request: 
     if stream:
         return await _stream_response(url, headers, body, "openai", request)
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=90) as client:
         r = await client.post(url, headers=headers, json=body)
         if r.status_code != 200:
             _log_upstream_error(request, AI_PROVIDER, r.status_code, r.text)
@@ -1043,7 +769,7 @@ async def _forward_openai_compat(body: dict, model: str, stream: bool, request: 
 
 async def _stream_response(url: str, headers: dict, body: dict, provider: str, request: Request):
     async def generate():
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=90) as client:
             async with client.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code >= 400:
                     err_body = await r.aread()
@@ -1054,6 +780,125 @@ async def _stream_response(url: str, headers: dict, body: dict, provider: str, r
                     yield chunk
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ─── Validated boundaries ──────────────────────────────────────────────────
+
+async def read_json_object(request: Request, maximum_bytes: int = 2 * 1024 * 1024):
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum_bytes:
+            raise HTTPException(status_code=413, detail="Request is too large")
+        body.extend(chunk)
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Request must be an object")
+    return value
+
+
+def validate_pro_body(body: dict, *, responses_api: bool):
+    allowed = {DEFAULT_MODEL, "gpt-5.4-mini", "gpt-5.4-nano"}
+    configured = os.environ.get("ALLOWED_PRO_MODELS")
+    if configured:
+        allowed = {m.strip() for m in configured.split(",") if m.strip()}
+    model = body.get("model", DEFAULT_MODEL)
+    if not isinstance(model, str) or model not in allowed:
+        raise HTTPException(status_code=400, detail="This model is not available with ClawKeep Pro")
+    body["model"] = model
+    token_key = "max_output_tokens" if responses_api else ("max_completion_tokens" if model.startswith("gpt-5") else "max_tokens")
+    limits = []
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        value = body.pop(key, None)
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise HTTPException(status_code=400, detail="Invalid output limit")
+            limits.append(value)
+    body[token_key] = min([16384] + limits) if limits else (8192 if responses_api else 4096)
+    if responses_api:
+        calls = body.get("max_tool_calls", 8)
+        if not isinstance(calls, int) or isinstance(calls, bool) or calls < 1:
+            raise HTTPException(status_code=400, detail="Invalid tool limit")
+        body["max_tool_calls"] = min(calls, 12)
+        requested_tools = body.get("tools", [])
+        if not isinstance(requested_tools, list) or len(requested_tools) > 4:
+            raise HTTPException(status_code=400, detail="Invalid research tools")
+        for tool in requested_tools:
+            if not isinstance(tool, dict) or tool.get("type") not in ("web_search", "web_search_preview"):
+                raise HTTPException(status_code=400, detail="Unsupported research tool")
+    return body
+
+
+async def admit_job(request, body, mode):
+    key = request.headers.get("Idempotency-Key")
+    if key is not None and (not key.strip() or len(key) > 128):
+        raise HTTPException(status_code=400, detail="Invalid request key")
+    try:
+        return await job_store.create(str(uuid.uuid4()), request.state.sub, body,
+                                      mode=mode, idempotency_key=key)
+    except JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except JobCapacityError as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "15"})
+
+
+def job_capability(job_id):
+    return hmac.new(JWT_SECRET.encode(), ("research:" + job_id).encode(), hashlib.sha256).hexdigest()
+
+
+async def start_response(job_id, include_capability=False):
+    job = await job_store.get_by_id_only(job_id)
+    response = {"job_id": job_id, "status": job["status"]}
+    if include_capability:
+        response["job_token"] = job_capability(job_id)
+    return JSONResponse(response)
+
+
+async def authorize_job(request, job_id):
+    identity = await job_store.identity(job_id)
+    if identity is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if identity["mode"] == "pro":
+        check_auth(request)
+        authorized = request.state.sub == identity["sub"]
+    else:
+        authorized = hmac.compare_digest(request.headers.get("X-Research-Token", ""), job_capability(job_id))
+    if not authorized:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+
+@app.post("/app-store/notifications")
+@limiter.limit("60/minute", key_func=get_remote_address)
+async def app_store_notification(request: Request):
+    body = await read_json_object(request)
+    signed = body.get("signedPayload")
+    if not isinstance(signed, str):
+        raise HTTPException(status_code=400, detail="Missing signed notification")
+    try:
+        verifier = _VERIFIERS[0][1]
+        notification = verifier.verify_and_decode_notification(signed)
+        transaction = verifier.verify_and_decode_signed_transaction(notification.data.signedTransactionInfo)
+    except (VerificationException, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid signed notification")
+    transaction_id = str(transaction.transactionId or "")
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="Missing transaction")
+    kind = getattr(notification.notificationType, "value", notification.notificationType)
+    if kind in ("REFUND", "REVOKE", "REFUND_REVERSED"):
+        expiry = max(time.time() + 900, (transaction.expiresDate or 0) / 1000)
+        job_store.set_revoked(transaction_id, expiry, revoked=kind != "REFUND_REVERSED")
+    return JSONResponse({"status": "ok"})
+
+
+@app.on_event("shutdown")
+async def shutdown_jobs():
+    task = getattr(app.state, "job_cleanup_task", None)
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    await job_store.close()
 
 
 # ─── Entry ────────────────────────────────────────────────────────────────────
